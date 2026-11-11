@@ -1,0 +1,13 @@
+apps-script
+cloudflare-worker/**
+node_modules
+docs
+request_img
+dist
+member_management_project.pdf
+.env
+.env.local
+.dev.vars
+.DS_Store
+!docs/
+!docs/**
