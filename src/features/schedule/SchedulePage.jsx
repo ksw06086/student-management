@@ -104,6 +104,11 @@ function timeValue(datetime) {
 function seoulDatetime(date, time, allDay) {
   return `${date}T${allDay ? '00:00' : time}:00+09:00`;
 }
+function occurrenceDateTime(date, datetime, allDay) {
+  if (allDay) return `${date}T00:00:00+09:00`;
+  const match = /T(\d{2}:\d{2})(?::(\d{2}))?/.exec(String(datetime || ''));
+  return `${date}T${match ? `${match[1]}:${match[2] || '00'}` : '00:00:00'}+09:00`;
+}
 function formatDate(date) {
   return formatKoreanDate(date);
 }
@@ -663,13 +668,29 @@ export default function SchedulePage({ auth, notify }) {
                   <i style={{ backgroundColor: safeColor(category?.color_hex) }} />
                   <span className="agenda-date">
                     {event.occurrence_start_date === event.occurrence_end_date
-                      ? formatDate(event.occurrence_start_date)
-                      : `${formatDate(event.occurrence_start_date)} – ${formatDate(event.occurrence_end_date)}`}
+                      ? formatKoreanDateTime(
+                          occurrenceDateTime(
+                            event.occurrence_start_date,
+                            event.start_datetime,
+                            event.all_day,
+                          ),
+                        )
+                      : `${formatKoreanDateTime(
+                          occurrenceDateTime(
+                            event.occurrence_start_date,
+                            event.start_datetime,
+                            event.all_day,
+                          ),
+                        )} – ${formatKoreanDateTime(
+                          occurrenceDateTime(
+                            event.occurrence_end_date,
+                            event.end_datetime,
+                            event.all_day,
+                          ),
+                        )}`}
                   </span>
                   <span className="agenda-time">
-                    {event.all_day
-                      ? '종일'
-                      : `${timeValue(event.start_datetime)}–${timeValue(event.end_datetime)}`}
+                    {event.all_day ? '종일' : ''}
                   </span>
                   <b>{event.title}</b>
                   <small>{category?.category_name || '기타'}</small>
@@ -963,6 +984,16 @@ function ScheduleDetail({ schedule, category, onClose, onEdit, onDelete }) {
   }, [onClose]);
   const startDate = schedule.occurrence_start_date || schedule.start_datetime.slice(0, 10);
   const endDate = schedule.occurrence_end_date || schedule.end_datetime.slice(0, 10);
+  const detailStart = occurrenceDateTime(
+    startDate,
+    schedule.start_datetime,
+    schedule.all_day,
+  );
+  const detailEnd = occurrenceDateTime(
+    endDate,
+    schedule.end_datetime,
+    schedule.all_day,
+  );
   const repeatLabels = { none: '', daily: '매일', weekly: '매주', monthly: '매월' };
   const repeatUnit = { daily: '일', weekly: '주', monthly: '개월' }[schedule.repeat_type];
   return (
@@ -999,12 +1030,9 @@ function ScheduleDetail({ schedule, category, onClose, onEdit, onDelete }) {
           <h2 id="schedule-detail-title">{schedule.title}</h2>
           <p className="detail-datetime">
             {startDate === endDate
-              ? formatDate(startDate)
-              : `${formatDate(startDate)} – ${formatDate(endDate)}`}
-            <br />
-            {schedule.all_day
-              ? '종일'
-              : `${timeValue(schedule.start_datetime)} – ${timeValue(schedule.end_datetime)}`}
+              ? formatKoreanDateTime(detailStart)
+              : `${formatKoreanDateTime(detailStart)} – ${formatKoreanDateTime(detailEnd)}`}
+            {schedule.all_day && <><br />종일</>}
           </p>
           {schedule.repeat_type !== 'none' && (
             <>
@@ -1014,7 +1042,7 @@ function ScheduleDetail({ schedule, category, onClose, onEdit, onDelete }) {
                   ? `${schedule.repeat_interval}${repeatUnit}마다`
                   : repeatLabels[schedule.repeat_type]}
                 {schedule.repeat_until
-                  ? ` · ${formatDate(schedule.repeat_until)}까지`
+                  ? ` · ${formatKoreanDateTime(schedule.repeat_until)}까지`
                   : ' · 종료일 없음'}
               </p>
               <p className="schedule-repeat-note">
