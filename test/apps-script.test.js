@@ -358,6 +358,16 @@ test('Apps Script API authentication, roles, student lifecycle, statistics, logs
         student: { student_id: 'C002', name: 'User Created' },
       });
       assert.equal(created.ok, true, created.error);
+      assert.match(created.student.created_at, /^\d{4}\.\d{2}\.\d{2}\(.+\) \d{2}:\d{2}:\d{2}$/);
+      const currentSheet = app.sheets.get('\uC7AC\uD559\uC0DD');
+      currentSheet.rows[1][10] =
+        (Date.UTC(2026, 10, 17) - Date.UTC(1899, 11, 30)) / 86400000 +
+        (14 * 3600 + 30 * 60 + 25) / 86400;
+      const dateCellRead = app.call({ action: 'currentStudents', token: userLogin.token });
+      assert.equal(
+        dateCellRead.students.find(student => student.student_id === 'C001').updated_at,
+        '2026.11.17(화) 14:30:25',
+      );
       const userUpdated = app.call({
         action: 'saveCurrentStudent',
         token: userLogin.token,
@@ -1169,6 +1179,61 @@ test('Apps Script API authentication, roles, student lifecycle, statistics, logs
       false,
     );
   });
+});
+
+test('regular users read and add current-student counseling in a Korean-header sheet', () => {
+  const app = makeHarness();
+  const localizedName = '\uC0C1\uB2F4\uC774\uB825';
+  const headers = [
+    '\uC0C1\uB2F4ID',
+    '\uC878\uC5C5\uC5F0\uB3C4',
+    '\uD559\uBC88',
+    '\uD559\uC0DD\uC774\uB984',
+    '\uC0C1\uB2F4\uC77C\uC2DC',
+    '\uC0C1\uB2F4\uB0B4\uC6A9',
+    '\uC791\uC131\uC790ID',
+    '\uC791\uC131\uC790\uBA85',
+    '\uC0DD\uC131\uC77C\uC2DC',
+    '\uC218\uC815\uC77C\uC2DC',
+  ];
+  const sheet = new Sheet(localizedName);
+  sheet.rows = [
+    headers,
+    [
+      'existing-counseling',
+      '\uC7AC\uD559\uC0DD',
+      'C001',
+      'Current Student',
+      '2026.01.01(목)',
+      '기존 상담 내용',
+      'admin',
+      'Admin User',
+      '2026-01-01',
+      '2026-01-01',
+    ],
+  ];
+  app.sheets.set(localizedName, sheet);
+  app.setGoogleProfile({ email: 'legacy@example.com', email_verified: true, aud: 'test-client' });
+  const user = app.call({ action: 'googleLogin', accessToken: 'mock-token' });
+
+  const existing = app.call({
+    action: 'currentCounselings',
+    token: user.token,
+    studentId: 'C001',
+  });
+  assert.equal(existing.ok, true, existing.error);
+  assert.equal(existing.counselings[0].content, '기존 상담 내용');
+
+  const saved = app.call({
+    action: 'saveCurrentCounseling',
+    token: user.token,
+    studentId: 'C001',
+    counseling: { counseledAt: '2026-02-02T10:30', content: '새 상담 내용' },
+  });
+  assert.equal(saved.ok, true, saved.error);
+  assert.equal(saved.counseling.content, '새 상담 내용');
+  assert.equal(sheet.rows[0][5], '\uC0C1\uB2F4\uB0B4\uC6A9');
+  assert.equal(sheet.rows.at(-1)[5], '새 상담 내용');
 });
 
 test('graduate transfer creates only the server current-year tab from the latest template without copying its student rows', () => {

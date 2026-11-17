@@ -1,5 +1,19 @@
 const SEOUL_TIME_ZONE = 'Asia/Seoul';
 const WEEKDAYS = ['일', '월', '화', '수', '목', '금', '토'];
+const ENGLISH_MONTHS = {
+  jan: 1,
+  feb: 2,
+  mar: 3,
+  apr: 4,
+  may: 5,
+  jun: 6,
+  jul: 7,
+  aug: 8,
+  sep: 9,
+  oct: 10,
+  nov: 11,
+  dec: 12,
+};
 
 function validYmd(year, month, day) {
   if (year < 1 || month < 1 || month > 12 || day < 1 || day > 31) return false;
@@ -28,13 +42,87 @@ export function parseStoredDate(value) {
   if (value == null || value === '') return null;
   if (value instanceof Date)
     return Number.isNaN(value.getTime()) ? null : { date: value, dateOnly: false };
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) return null;
+    if (Number.isInteger(value) && String(Math.abs(value)).length === 10)
+      return { date: new Date(value * 1000), dateOnly: false };
+    if (Number.isInteger(value) && String(Math.abs(value)).length === 13)
+      return { date: new Date(value), dateOnly: false };
+    if (value >= 20000 && value < 100000) {
+      const wholeDays = Math.floor(value);
+      const civilDate = new Date(Date.UTC(1899, 11, 30 + wholeDays));
+      const year = civilDate.getUTCFullYear();
+      const month = civilDate.getUTCMonth() + 1;
+      const day = civilDate.getUTCDate();
+      const dayFraction = value - wholeDays;
+      if (dayFraction < 0.0000001) return dateOnlyResult(year, month, day);
+      const seconds = Math.round(dayFraction * 24 * 60 * 60);
+      return parseSeoulDateTime(
+        year,
+        month,
+        day,
+        Math.floor(seconds / 3600),
+        Math.floor((seconds % 3600) / 60),
+        seconds % 60,
+      );
+    }
+    return null;
+  }
   const text = String(value).trim();
   if (!text) return null;
+  if (/^-?\d{10}$/.test(text) || /^\d{13}$/.test(text)) return parseStoredDate(Number(text));
 
   let match = /^(\d{4})(\d{2})(\d{2})$/.exec(text);
   if (match) return dateOnlyResult(Number(match[1]), Number(match[2]), Number(match[3]));
   match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
   if (match) return dateOnlyResult(Number(match[1]), Number(match[2]), Number(match[3]));
+  match = /^(\d{4})\/(\d{1,2})\/(\d{1,2})$/.exec(text);
+  if (match) return dateOnlyResult(Number(match[1]), Number(match[2]), Number(match[3]));
+  match = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(text);
+  if (match) return dateOnlyResult(Number(match[3]), Number(match[1]), Number(match[2]));
+  match = /^(\d{4})年(\d{1,2})月(\d{1,2})日(?:\s+(\d{2}):(\d{2})(?::(\d{2}))?)?$/.exec(
+    text,
+  );
+  if (match) {
+    const [, year, month, day, hour, minute, second = '0'] = match;
+    return hour === undefined
+      ? dateOnlyResult(Number(year), Number(month), Number(day))
+      : parseSeoulDateTime(
+          Number(year),
+          Number(month),
+          Number(day),
+          Number(hour),
+          Number(minute),
+          Number(second),
+        );
+  }
+  match = /^(\d{4})\.(\d{2})\.(\d{2})\(([^)]{1,12})\)(?:\s+(\d{2}):(\d{2}):(\d{2}))?$/.exec(
+    text,
+  );
+  if (match) {
+    const [, year, month, day, , hour, minute, second] = match;
+    return hour === undefined
+      ? dateOnlyResult(Number(year), Number(month), Number(day))
+      : parseSeoulDateTime(
+          Number(year),
+          Number(month),
+          Number(day),
+          Number(hour),
+          Number(minute),
+          Number(second),
+        );
+  }
+  match = /^(?:[A-Za-z]{3},?\s+)?(?:(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})|([A-Za-z]{3})\s+(\d{1,2})\s+(\d{4}))$/.exec(
+    text,
+  );
+  if (match) {
+    const [, dayFirstDay, dayFirstMonth, dayFirstYear, monthFirstMonth, monthFirstDay, monthFirstYear] =
+      match;
+    const year = Number(dayFirstYear || monthFirstYear);
+    const month = ENGLISH_MONTHS[(dayFirstMonth || monthFirstMonth).toLowerCase()];
+    const day = Number(dayFirstDay || monthFirstDay);
+    return month ? dateOnlyResult(year, month, day) : null;
+  }
 
   // The display form is also accepted so already formatted counseling values stay editable.
   match = /^(\d{4})\.(\d{2})\.(\d{2})\(([월화수목금토일])\)(?: (\d{2}):(\d{2}):(\d{2}))?$/.exec(
@@ -125,9 +213,8 @@ export function formatKoreanDateTime(value) {
   const parsed = parseStoredDate(value);
   if (!parsed) return String(value);
   const parts = dateParts(parsed.date);
-  return parsed.dateOnly
-    ? formatParts(parts)
-    : `${formatParts(parts)} ${parts.hour}:${parts.minute}:${parts.second}`;
+  // Date-only cells have no stored clock time; midnight is a display-only placeholder.
+  return `${formatParts(parts)} ${parsed.dateOnly ? '00' : parts.hour}:${parsed.dateOnly ? '00' : parts.minute}:${parsed.dateOnly ? '00' : parts.second}`;
 }
 
 export function toDateInputValue(value) {
@@ -149,7 +236,7 @@ export function formatKoreanPreservedDate(value, { dateOnly = false } = {}) {
   if (!parsed) return String(value);
   const parts = dateParts(parsed.date);
   return dateOnly || parsed.dateOnly
-    ? formatParts(parts)
+    ? `${formatParts(parts)} 00:00:00`
     : `${formatParts(parts)} ${parts.hour}:${parts.minute}:${parts.second}`;
 }
 
