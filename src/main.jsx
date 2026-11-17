@@ -33,8 +33,7 @@ import { filterStudentRows } from './features/graduates/studentTableUtils.js';
 import {
   formatKoreanDateTime,
   formatTransferDetailForDisplay,
-  hasStoredTime,
-  toDateInputValue,
+  toDateTimeLocalValue,
 } from './shared/dateFormat.js';
 import { api } from './services/api.js';
 import ToastViewport from './components/ToastViewport.jsx';
@@ -422,15 +421,15 @@ function App() {
   // 상담 요청은 연도와 학생 ID를 함께 보내 서버에서 학생별로 분리합니다.
   const saveCounseling = () =>
     run(async () => {
-      const date = toDateInputValue(counselingDraft?.counseledAt);
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error('상담 날짜를 입력하세요.');
+      const dateTime = String(counselingDraft?.counseledAt || '').trim();
+      if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(dateTime))
+        throw new Error('상담 날짜와 시간을 입력하세요.');
       const originalDate = counselingDraft?.originalCounseledAt;
       const storedValue =
         counselingDraft?.counselingId &&
-        toDateInputValue(originalDate) === date &&
-        hasStoredTime(originalDate)
+        toDateTimeLocalValue(originalDate) === dateTime
           ? originalDate
-          : date;
+          : dateTime;
       await api('saveCounseling', {
         token: auth.token,
         year,
@@ -1109,7 +1108,7 @@ function StudentsCounseling({
   const pageCount = Math.max(1, Math.ceil(records.length / pageSize));
   const visible = records.slice((page - 1) * pageSize, page * pageSize);
   const openNew = () =>
-    setDraft({ counselingId: '', counseledAt: toDateInputValue(new Date()), content: '' });
+    setDraft({ counselingId: '', counseledAt: toDateTimeLocalValue(new Date()), content: '' });
   const closeOnBackdrop = event => {
     if (event.target === event.currentTarget) {
       setDetail(null);
@@ -1224,7 +1223,7 @@ function StudentsCounseling({
                   setDraft({
                     ...detail,
                     originalCounseledAt: detail.counseledAt,
-                    counseledAt: toDateInputValue(detail.counseledAt),
+                    counseledAt: toDateTimeLocalValue(detail.counseledAt),
                   });
                   setDetail(null);
                 }}
@@ -1256,10 +1255,11 @@ function StudentsCounseling({
             </header>
             <div className="counseling-modal-body">
               <label className="field">
-                <span>상담 날짜 *</span>
+                <span>상담 날짜 및 시간 *</span>
                 <input
-                  type="date"
-                  value={toDateInputValue(draft.counseledAt)}
+                  type="datetime-local"
+                  step="1"
+                  value={toDateTimeLocalValue(draft.counseledAt)}
                   onChange={event => setDraft({ ...draft, counseledAt: event.target.value })}
                 />
               </label>

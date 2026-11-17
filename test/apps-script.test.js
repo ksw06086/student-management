@@ -375,13 +375,25 @@ test('Apps Script API authentication, roles, student lifecycle, statistics, logs
       });
       assert.equal(userUpdated.ok, true, userUpdated.error);
       assert.equal(userUpdated.student.affiliation, '사용자 수정');
+      const counselingWithoutTime = app.call({
+        action: 'saveCurrentCounseling',
+        token: userLogin.token,
+        studentId: 'C002',
+        counseling: { counseledAt: '2026-01-01', content: '시간이 빠진 상담' },
+      });
+      assert.equal(counselingWithoutTime.ok, false);
       const counseling = app.call({
         action: 'saveCurrentCounseling',
         token: userLogin.token,
         studentId: 'C002',
-        counseling: { counseledAt: '2026-01-01T00:00', content: '사용자 상담 기록' },
+        counseling: { counseledAt: '2026-01-01T14:35:28', content: '사용자 상담 기록' },
       });
       assert.equal(counseling.ok, true, counseling.error);
+      assert.equal(counseling.counseling.counseledAt, '2026.01.01(목) 14:35:28');
+      assert.equal(
+        app.sheets.get('\uC0C1\uB2F4\uC774\uB825').rows.at(-1)[4],
+        '2026.01.01(목) 14:35:28',
+      );
       const currentCounselings = app.call({
         action: 'currentCounselings',
         token: userLogin.token,

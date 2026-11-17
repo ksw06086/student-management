@@ -224,6 +224,14 @@ export function toDateInputValue(value) {
   return `${parts.year}-${parts.month}-${parts.day}`;
 }
 
+/** Return an Asia/Seoul civil datetime value suitable for input[type="datetime-local"]. */
+export function toDateTimeLocalValue(value) {
+  const parsed = parseStoredDate(value);
+  if (!parsed) return '';
+  const parts = dateParts(parsed.date);
+  return `${parts.year}-${parts.month}-${parts.day}T${parsed.dateOnly ? '00' : parts.hour}:${parsed.dateOnly ? '00' : parts.minute}:${parsed.dateOnly ? '00' : parts.second}`;
+}
+
 export function hasStoredTime(value) {
   const parsed = parseStoredDate(value);
   return Boolean(parsed && !parsed.dateOnly);
