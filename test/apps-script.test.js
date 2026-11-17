@@ -375,13 +375,6 @@ test('Apps Script API authentication, roles, student lifecycle, statistics, logs
       });
       assert.equal(userUpdated.ok, true, userUpdated.error);
       assert.equal(userUpdated.student.affiliation, '사용자 수정');
-      const counselingWithoutTime = app.call({
-        action: 'saveCurrentCounseling',
-        token: userLogin.token,
-        studentId: 'C002',
-        counseling: { counseledAt: '2026-01-01', content: '시간이 빠진 상담' },
-      });
-      assert.equal(counselingWithoutTime.ok, false);
       const counseling = app.call({
         action: 'saveCurrentCounseling',
         token: userLogin.token,
@@ -389,10 +382,10 @@ test('Apps Script API authentication, roles, student lifecycle, statistics, logs
         counseling: { counseledAt: '2026-01-01T14:35:28', content: '사용자 상담 기록' },
       });
       assert.equal(counseling.ok, true, counseling.error);
-      assert.equal(counseling.counseling.counseledAt, '2026.01.01(목) 14:35:28');
+      assert.equal(counseling.counseling.counseledAt, '2026.01.01(목)');
       assert.equal(
         app.sheets.get('\uC0C1\uB2F4\uC774\uB825').rows.at(-1)[4],
-        '2026.01.01(목) 14:35:28',
+        '2026.01.01(목)',
       );
       const currentCounselings = app.call({
         action: 'currentCounselings',
@@ -1216,12 +1209,12 @@ test('regular users read and add current-student counseling in a Korean-header s
       '\uC7AC\uD559\uC0DD',
       'C001',
       'Current Student',
-      '2026.01.01(목)',
+      new Date('2026-01-01T09:20:30+09:00'),
       '기존 상담 내용',
       'admin',
       'Admin User',
-      '2026-01-01',
-      '2026-01-01',
+      '2026.01.01(목) 09:00:00',
+      '2026.01.01(목) 09:00:00',
     ],
   ];
   app.sheets.set(localizedName, sheet);
@@ -1233,19 +1226,24 @@ test('regular users read and add current-student counseling in a Korean-header s
     token: user.token,
     studentId: 'C001',
   });
-  assert.equal(existing.ok, true, existing.error);
-  assert.equal(existing.counselings[0].content, '기존 상담 내용');
+      assert.equal(existing.ok, true, existing.error);
+      assert.equal(existing.counselings[0].content, '기존 상담 내용');
+      assert.equal(existing.counselings[0].counseledAt, '2026.01.01(목)');
+      assert.match(existing.counselings[0].createdAt, /^\d{4}\.\d{2}\.\d{2}\(.+\) \d{2}:\d{2}:\d{2}$/);
 
   const saved = app.call({
     action: 'saveCurrentCounseling',
     token: user.token,
     studentId: 'C001',
-    counseling: { counseledAt: '2026-02-02T10:30', content: '새 상담 내용' },
+    counseling: { counseledAt: '2026-02-02', content: '새 상담 내용' },
   });
   assert.equal(saved.ok, true, saved.error);
   assert.equal(saved.counseling.content, '새 상담 내용');
+  assert.equal(saved.counseling.counseledAt, '2026.02.02(월)');
   assert.equal(sheet.rows[0][5], '\uC0C1\uB2F4\uB0B4\uC6A9');
   assert.equal(sheet.rows.at(-1)[5], '새 상담 내용');
+  assert.match(sheet.rows.at(-1)[8], /^\d{4}\.\d{2}\.\d{2}\(.+\) \d{2}:\d{2}:\d{2}$/);
+  assert.match(sheet.rows.at(-1)[9], /^\d{4}\.\d{2}\.\d{2}\(.+\) \d{2}:\d{2}:\d{2}$/);
 });
 
 test('graduate transfer creates only the server current-year tab from the latest template without copying its student rows', () => {

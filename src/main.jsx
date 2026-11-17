@@ -31,9 +31,10 @@ import {
 } from './features/dashboard/DashboardComponents.jsx';
 import { filterStudentRows } from './features/graduates/studentTableUtils.js';
 import {
+  formatKoreanDate,
   formatKoreanDateTime,
   formatTransferDetailForDisplay,
-  toDateTimeLocalValue,
+  toDateInputValue,
 } from './shared/dateFormat.js';
 import { api } from './services/api.js';
 import ToastViewport from './components/ToastViewport.jsx';
@@ -421,23 +422,15 @@ function App() {
   // 상담 요청은 연도와 학생 ID를 함께 보내 서버에서 학생별로 분리합니다.
   const saveCounseling = () =>
     run(async () => {
-      const dateTime = String(counselingDraft?.counseledAt || '').trim();
-      if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(dateTime))
-        throw new Error('상담 날짜와 시간을 입력하세요.');
-      const originalDate = counselingDraft?.originalCounseledAt;
-      const storedValue =
-        counselingDraft?.counselingId &&
-        toDateTimeLocalValue(originalDate) === dateTime
-          ? originalDate
-          : dateTime;
+      const date = toDateInputValue(counselingDraft?.counseledAt);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error('상담 날짜를 입력하세요.');
       await api('saveCounseling', {
         token: auth.token,
         year,
         studentId: counselingStudentId,
         counseling: {
           ...counselingDraft,
-          originalCounseledAt: undefined,
-          counseledAt: storedValue,
+          counseledAt: date,
         },
       });
       setCounselingDraft(null);
@@ -1108,7 +1101,7 @@ function StudentsCounseling({
   const pageCount = Math.max(1, Math.ceil(records.length / pageSize));
   const visible = records.slice((page - 1) * pageSize, page * pageSize);
   const openNew = () =>
-    setDraft({ counselingId: '', counseledAt: toDateTimeLocalValue(new Date()), content: '' });
+    setDraft({ counselingId: '', counseledAt: toDateInputValue(new Date()), content: '' });
   const closeOnBackdrop = event => {
     if (event.target === event.currentTarget) {
       setDetail(null);
@@ -1143,7 +1136,7 @@ function StudentsCounseling({
                   key={record.counselingId}
                   onClick={() => setDetail(record)}
                 >
-                  <time>{formatKoreanDateTime(record.counseledAt)}</time>
+                  <time>{formatKoreanDate(record.counseledAt)}</time>
                   <span>{record.content}</span>
                   <small>{record.authorName || ''}</small>
                 </button>
@@ -1189,7 +1182,7 @@ function StudentsCounseling({
             <div className="counseling-modal-body">
               <dl>
                 <dt>상담일자</dt>
-                <dd>{formatKoreanDateTime(detail.counseledAt)}</dd>
+                <dd>{formatKoreanDate(detail.counseledAt)}</dd>
                 {detail.authorName && (
                   <>
                     <dt>작성자</dt>
@@ -1222,8 +1215,7 @@ function StudentsCounseling({
                 onClick={() => {
                   setDraft({
                     ...detail,
-                    originalCounseledAt: detail.counseledAt,
-                    counseledAt: toDateTimeLocalValue(detail.counseledAt),
+                    counseledAt: toDateInputValue(detail.counseledAt),
                   });
                   setDetail(null);
                 }}
@@ -1255,11 +1247,10 @@ function StudentsCounseling({
             </header>
             <div className="counseling-modal-body">
               <label className="field">
-                <span>상담 날짜 및 시간 *</span>
+                <span>상담 날짜 *</span>
                 <input
-                  type="datetime-local"
-                  step="1"
-                  value={toDateTimeLocalValue(draft.counseledAt)}
+                  type="date"
+                  value={toDateInputValue(draft.counseledAt)}
                   onChange={event => setDraft({ ...draft, counseledAt: event.target.value })}
                 />
               </label>

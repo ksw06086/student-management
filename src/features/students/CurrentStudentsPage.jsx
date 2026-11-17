@@ -2,8 +2,9 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { GraduationCap, Plus, RefreshCw, Save, X } from 'lucide-react';
 import StudentListHeader from '../../components/StudentListHeader.jsx';
 import {
+  formatKoreanDate,
   formatKoreanDateTime,
-  toDateTimeLocalValue,
+  toDateInputValue,
 } from '../../shared/dateFormat.js';
 
 const EMPTY = {
@@ -142,19 +143,12 @@ export default function CurrentStudentsPage({
   };
   const saveCounseling = () =>
     run(async () => {
-      const dateTime = String(counselDraft.counseledAt || '').trim();
-      if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(dateTime))
-        throw new Error('상담 날짜와 시간을 입력하세요.');
-      const originalDate = counselDraft.originalCounseledAt;
-      const storedValue =
-        counselDraft.counselingId &&
-        toDateTimeLocalValue(originalDate) === dateTime
-          ? originalDate
-          : dateTime;
+      const date = toDateInputValue(counselDraft.counseledAt);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error('상담 날짜를 입력하세요.');
       await api('saveCurrentCounseling', {
         token: auth.token,
         studentId: selected.student_id,
-        counseling: { ...counselDraft, counseledAt: storedValue },
+        counseling: { ...counselDraft, counseledAt: date },
       });
       setCounselDraft(null);
       await loadRecords(selected.student_id);
@@ -324,7 +318,7 @@ export default function CurrentStudentsPage({
                   className="primary-button"
                   onClick={() =>
                     setCounselDraft({
-                      counseledAt: toDateTimeLocalValue(new Date()),
+                      counseledAt: toDateInputValue(new Date()),
                       content: '',
                     })
                   }
@@ -356,7 +350,7 @@ export default function CurrentStudentsPage({
                     key={record.counselingId}
                     onClick={() => setDetail(record)}
                   >
-                    <time>{formatKoreanDateTime(record.counseledAt)}</time>
+                    <time>{formatKoreanDate(record.counseledAt)}</time>
                     <span>{record.content}</span>
                     <small>{record.authorName}</small>
                   </button>
@@ -414,18 +408,17 @@ export default function CurrentStudentsPage({
               {detail ? (
                 <>
                   <p>
-                    {formatKoreanDateTime(detail.counseledAt)} · {detail.authorName}
+                    {formatKoreanDate(detail.counseledAt)} · {detail.authorName}
                   </p>
                   <div className="counseling-full-content">{detail.content}</div>
                 </>
               ) : (
                 <>
                   <label className="field">
-                    <span>상담 날짜 및 시간 *</span>
+                    <span>상담 날짜 *</span>
                     <input
-                      type="datetime-local"
-                      step="1"
-                      value={toDateTimeLocalValue(counselDraft.counseledAt)}
+                      type="date"
+                      value={toDateInputValue(counselDraft.counseledAt)}
                       onChange={e =>
                         setCounselDraft({ ...counselDraft, counseledAt: e.target.value })
                       }
@@ -453,8 +446,7 @@ export default function CurrentStudentsPage({
                     onClick={() => {
                       setCounselDraft({
                         counselingId: detail.counselingId,
-                        originalCounseledAt: detail.counseledAt,
-                        counseledAt: toDateTimeLocalValue(detail.counseledAt),
+                        counseledAt: toDateInputValue(detail.counseledAt),
                         content: detail.content,
                       });
                       setDetail(null);

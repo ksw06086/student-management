@@ -8,7 +8,6 @@ import {
   hasStoredTime,
   parseStoredDate,
   toDateInputValue,
-  toDateTimeLocalValue,
 } from '../src/shared/dateFormat.js';
 
 test('formats legacy mixed-language timestamps in Seoul time and 24-hour format', () => {
@@ -76,14 +75,15 @@ test('parses ISO and Seoul-local timestamps while preserving the civil date', ()
   assert.equal(hasStoredTime('2026-10-07T11:08:05'), true);
 });
 
-test('creates datetime-local values using Seoul wall time and preserves seconds', () => {
-  assert.equal(
-    toDateTimeLocalValue(new Date('2026-11-17T05:35:28.000Z')),
-    '2026-11-17T14:35:28',
-  );
-  assert.equal(toDateTimeLocalValue('2026.11.17(화) 14:35:28'), '2026-11-17T14:35:28');
-  assert.equal(toDateTimeLocalValue('2026-11-17'), '2026-11-17T00:00:00');
-  assert.equal(toDateTimeLocalValue('not a date'), '');
+test('formats counseling dates without time while keeping the Seoul civil date', () => {
+  const values = [
+    '2026.11.03(화) 00:00:00',
+    '2026-11-03',
+    '2026/11/03',
+    '2026-11-03T00:00:00',
+    new Date('2026-11-03T00:00:00+09:00'),
+  ];
+  for (const value of values) assert.equal(formatKoreanDate(value), '2026.11.03(화)');
 });
 
 test('formats only recognized date fields in existing transfer details', () => {
