@@ -101,6 +101,23 @@ export default function CurrentStudentsPage({
       setDraft(result.student);
       setMessage('재학생 정보를 저장했습니다.');
     });
+  const deleteStudent = () => {
+    if (!selected || loading) return;
+    if (!window.confirm(`${selected.name} 학생을 재학생 명단에서 삭제할까요?`)) return;
+    run(async () => {
+      await api('deleteCurrentStudent', {
+        token: auth.token,
+        studentId: selected.student_id,
+      });
+      setSelected(null);
+      setDraft(null);
+      setRecords([]);
+      setCounselDraft(null);
+      setDetail(null);
+      await refresh();
+      setMessage('재학생 정보가 삭제되었습니다.');
+    });
+  };
   const transferStudent = () => {
     if (!selected || transferInProgress || loading) return;
     setTransferInProgress(true);
@@ -180,6 +197,13 @@ export default function CurrentStudentsPage({
           <StudentListHeader
             title="재학생 명단"
             count={filtered.length}
+            countLabel={
+              load === 'loading'
+                ? '불러오는 중...'
+                : load === 'error'
+                  ? '불러오기 실패'
+                  : `총 ${filtered.length}명`
+            }
             query={query}
             onQueryChange={setQuery}
             placeholder="이름, 학번, 연락처, 이메일, 소속 검색"
@@ -264,7 +288,7 @@ export default function CurrentStudentsPage({
                 >
                   <Save size={16} /> 저장
                 </button>
-                {selected && (
+                {selected && auth.user?.role === 'admin' && (
                   <button
                     className="outline-button transfer-button"
                     disabled={loading || transferInProgress || !selected.student_id?.trim()}
@@ -272,6 +296,15 @@ export default function CurrentStudentsPage({
                   >
                     <GraduationCap size={16} />
                     {transferInProgress ? '전환 처리 중…' : '졸업생 전환'}
+                  </button>
+                )}
+                {selected && (
+                  <button
+                    className="danger-text-button"
+                    disabled={loading}
+                    onClick={deleteStudent}
+                  >
+                    삭제
                   </button>
                 )}
               </div>

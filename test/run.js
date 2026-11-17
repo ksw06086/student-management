@@ -4,3 +4,4 @@ import './employment.test.js';
 import './schedules.test.js';
 import './student-table.test.js';
 import './date-format.test.js';
+import './boards.test.js';

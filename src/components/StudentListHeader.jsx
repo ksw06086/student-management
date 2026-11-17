@@ -4,6 +4,7 @@ import { Search, X } from 'lucide-react';
 export default function StudentListHeader({
   title,
   count,
+  countLabel,
   query,
   onQueryChange,
   placeholder,
@@ -12,7 +13,7 @@ export default function StudentListHeader({
   return (
     <header className="panel-title student-list-header">
       <h2 className="student-list-heading">{title}</h2>
-      <small className="student-list-total">총 {count}명</small>
+      <small className="student-list-total">{countLabel ?? `총 ${count}명`}</small>
       <div className="search student-list-search">
         <Search size={16} aria-hidden="true" />
         <input

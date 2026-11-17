@@ -9,6 +9,7 @@ import {
   LayoutDashboard,
   LogOut,
   Menu,
+  MessagesSquare,
   Plus,
   RefreshCw,
   Save,
@@ -39,6 +40,7 @@ import { api } from './services/api.js';
 import ToastViewport from './components/ToastViewport.jsx';
 import LoginScreen from './features/auth/LoginScreen.jsx';
 import ArchivePage from './features/archive/ArchivePage.jsx';
+import BoardPage from './features/boards/BoardPage.jsx';
 import './styles.css';
 import './counseling.css';
 import './loading.css';
@@ -64,10 +66,11 @@ const EMPTY_STUDENT = {
 const NAV = [
   { id: 'dashboard', label: '대시보드', icon: LayoutDashboard },
   { id: 'students', label: '졸업생 명단', icon: GraduationCap },
-  { id: 'currentStudents', label: '재학생관리', icon: Users, admin: true },
+  { id: 'currentStudents', label: '재학생관리', icon: Users },
   { id: 'analytics', label: '통계 및 분석', icon: BarChart3 },
   { id: 'schedule', label: '일정', icon: CalendarDays },
   { id: 'archive', label: '자료실', icon: Archive },
+  { id: 'boards', label: '게시판', icon: MessagesSquare },
   { id: 'settings', label: '시스템 설정', icon: Settings, admin: true },
 ];
 const SESSION_KEY = 'alumni-management.session';
@@ -162,14 +165,21 @@ function App() {
   };
   // 로그인 응답의 토큰·사용자·시트 목록으로 앱 초기 상태를 채웁니다.
   const completeLogin = async result => {
+    const isAdmin = result.user?.role === 'admin';
+    const availableSheets = isAdmin ? result.sheets || [] : [];
     setAuth({ token: result.token, user: result.user });
     setSessionReady(true);
-    setSheets(result.sheets || []);
+    setSheets(availableSheets);
     setSheetsLoad({ status: 'loaded', error: '' });
-    const initialYear = result.sheets?.[0] || '';
+    const initialYear = availableSheets[0] || '';
     setYear(initialYear);
-    setPage('dashboard');
-    window.history.replaceState(null, '', '#/');
+    const initialPage = result.user?.role === 'admin' ? 'dashboard' : 'currentStudents';
+    setPage(initialPage);
+    window.history.replaceState(
+      null,
+      '',
+      initialPage === 'currentStudents' ? '#/current-students' : '#/',
+    );
     setMessage('로그인되었습니다.');
   };
   const googleLogin = () => {
@@ -275,11 +285,29 @@ function App() {
       .catch(() => setAuth(null))
       .finally(() => setSessionReady(true));
   }, [auth?.token, sessionReady]);
+  useEffect(() => {
+    if (!auth || !sessionReady || auth.user?.role === 'admin') return;
+    setSheets([]);
+    setYear('');
+    setStudents([]);
+    setStudentsLoad({ status: 'idle', error: '' });
+    setPage('currentStudents');
+    if (window.location.hash !== '#/current-students') {
+      window.history.replaceState(null, '', '#/current-students');
+    }
+  }, [auth, sessionReady]);
   // 인증 또는 선택 연도가 달라지면 그 연도 학생 목록을 다시 요청합니다.
   useEffect(() => {
-    if (auth && year) run(() => loadStudents(auth.token, year), `${year} 시트를 불러왔습니다.`);
-    else if (auth) loadStudents(auth.token, '');
-  }, [auth?.token, year]);
+    if (!auth || !sessionReady) return;
+    if (auth.user?.role !== 'admin') {
+      studentsFetchSequence.current += 1;
+      setStudents([]);
+      setStudentsLoad({ status: 'idle', error: '' });
+      return;
+    }
+    if (year) run(() => loadStudents(auth.token, year), `${year} 시트를 불러왔습니다.`);
+    else loadStudents(auth.token, '');
+  }, [auth?.token, auth?.user?.role, sessionReady, year]);
   useEffect(() => {
     if (page !== 'students' || !selected?.studentId) return;
     setCounselingStudentId(selected.studentId);
@@ -343,19 +371,17 @@ function App() {
     if (studentId) await run(() => loadCounselings(studentId));
   };
   const navigate = target => {
-    if (target === 'currentStudents' && auth?.user?.role !== 'admin') {
-      setMessage('재학생관리는 관리자만 이용할 수 있습니다.');
-      return;
-    }
-    setPage(target);
+    const isAdmin = auth?.user?.role === 'admin';
+    const nextTarget = isAdmin ? target : 'currentStudents';
+    setPage(nextTarget);
     window.history.replaceState(
       null,
       '',
-      target === 'currentStudents' ? '#/current-students' : '#/',
+      nextTarget === 'currentStudents' ? '#/current-students' : '#/',
     );
     setMenuOpen(false);
     setMessage('');
-    if (['analytics', 'settings'].includes(target)) loadPageData(target);
+    if (['analytics', 'settings'].includes(nextTarget)) loadPageData(nextTarget);
   };
   // 필터 결과는 원본 students를 변경하지 않고 상태·검색어에서 파생합니다.
   const filtered = useMemo(
@@ -553,8 +579,10 @@ function App() {
       </div>
     );
   if (!auth) return <LoginScreen onGoogle={googleLogin} loading={loading} message={message} />;
-  const currentNav = NAV.find(item => item.id === page)?.label || '대시보드';
   const isAdmin = auth.user.role === 'admin';
+  const activePage = isAdmin ? page : 'currentStudents';
+  const currentNav = NAV.find(item => item.id === activePage)?.label || '대시보드';
+  const visibleNavigation = isAdmin ? NAV : NAV.filter(item => item.id === 'currentStudents');
   return (
     <div className="app-shell design-shell">
       <aside className={`sidebar ${menuOpen ? 'open' : ''}`}>
@@ -576,10 +604,10 @@ function App() {
         </div>
         <nav>
           <p className="nav-label">MAIN MENU</p>
-          {NAV.filter(item => !item.admin || isAdmin).map(({ id, label, icon: Icon }) => (
+          {visibleNavigation.map(({ id, label, icon: Icon }) => (
             <button
               key={id}
-              className={`nav-item ${page === id ? 'active' : ''}`}
+              className={`nav-item ${activePage === id ? 'active' : ''}`}
               onClick={() => navigate(id)}
             >
               <Icon size={17} />
@@ -621,32 +649,21 @@ function App() {
           </div>
         </header>
         <main>
-          {page === 'currentStudents' &&
-            (isAdmin ? (
-              <CurrentStudentsPage
-                auth={auth}
-                api={api}
-                run={run}
-                loading={loading}
-                setMessage={setMessage}
-                onStudentTransferred={async targetYear => {
-                  await refreshSheetList(false);
-                  changeYear(targetYear);
-                  navigate('students');
-                }}
-              />
-            ) : (
-              <section className="panel access-denied" role="alert">
-                <div className="panel-title">
-                  <h2>접근 권한이 없습니다.</h2>
-                </div>
-                <p>재학생관리는 관리자만 이용할 수 있습니다.</p>
-                <button className="primary-button" onClick={() => navigate('dashboard')}>
-                  대시보드로 이동
-                </button>
-              </section>
-            ))}
-          {['dashboard', 'students'].includes(page) && (
+          {activePage === 'currentStudents' && (
+            <CurrentStudentsPage
+              auth={auth}
+              api={api}
+              run={run}
+              loading={loading}
+              setMessage={setMessage}
+              onStudentTransferred={async targetYear => {
+                await refreshSheetList(false);
+                changeYear(targetYear);
+                navigate('students');
+              }}
+            />
+          )}
+          {['dashboard', 'students'].includes(activePage) && (
             <>
               <section className="filters year-sheet-toolbar">
                 <label>
@@ -691,7 +708,7 @@ function App() {
                   </button>
                 </div>
               </section>
-              {page === 'dashboard' && (
+              {activePage === 'dashboard' && (
                 <EmploymentOverview
                   students={students}
                   year={year}
@@ -706,7 +723,7 @@ function App() {
                 onRetry={retryStudents}
                 onSelectStatus={openStudentsForStatus}
               />
-              {page === 'dashboard' && (
+              {activePage === 'dashboard' && (
                 <>
                   <section className="panel">
                     <div className="panel-title">
@@ -752,7 +769,7 @@ function App() {
                   </section>
                 </>
               )}
-              {page === 'students' && (
+              {activePage === 'students' && (
                 <>
                   <div className="student-detail-column">
                     <section className="panel detail-panel">
@@ -921,7 +938,7 @@ function App() {
               )}
             </>
           )}
-          {page === 'analytics' && (
+          {activePage === 'analytics' && (
             <section className="panel">
               <div className="panel-title">
                 <h2>졸업 연도별 통계</h2>
@@ -951,11 +968,14 @@ function App() {
               )}
             </section>
           )}
-          {page === 'schedule' && <SchedulePage auth={auth} notify={setMessage} />}
-          {page === 'archive' && (
+          {activePage === 'schedule' && <SchedulePage auth={auth} notify={setMessage} />}
+          {activePage === 'archive' && (
             <ArchivePage auth={auth} api={api} isAdmin={isAdmin} setMessage={setMessage} />
           )}
-          {page === 'settings' && isAdmin && (
+          {activePage === 'boards' && (
+            <BoardPage auth={auth} api={api} isAdmin={isAdmin} notify={setMessage} />
+          )}
+          {activePage === 'settings' && isAdmin && (
             <section className="panel table-panel">
               <div className="panel-title">
                 <h2>사용자 계정 관리</h2>
