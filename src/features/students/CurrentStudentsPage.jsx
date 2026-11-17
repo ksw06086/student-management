@@ -1,7 +1,10 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { GraduationCap, Plus, RefreshCw, Save, X } from 'lucide-react';
 import StudentListHeader from '../../components/StudentListHeader.jsx';
-import { formatKoreanDateTime, hasStoredTime, toDateInputValue } from '../../shared/dateFormat.js';
+import {
+  formatKoreanDateTime,
+  toDateTimeLocalValue,
+} from '../../shared/dateFormat.js';
 
 const EMPTY = {
   student_id: '',
@@ -139,14 +142,15 @@ export default function CurrentStudentsPage({
   };
   const saveCounseling = () =>
     run(async () => {
-      const date = toDateInputValue(counselDraft.counseledAt);
+      const dateTime = String(counselDraft.counseledAt || '').trim();
+      if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(dateTime))
+        throw new Error('상담 날짜와 시간을 입력하세요.');
       const originalDate = counselDraft.originalCounseledAt;
       const storedValue =
         counselDraft.counselingId &&
-        toDateInputValue(originalDate) === date &&
-        hasStoredTime(originalDate)
+        toDateTimeLocalValue(originalDate) === dateTime
           ? originalDate
-          : date;
+          : dateTime;
       await api('saveCurrentCounseling', {
         token: auth.token,
         studentId: selected.student_id,
@@ -319,7 +323,10 @@ export default function CurrentStudentsPage({
                 <button
                   className="primary-button"
                   onClick={() =>
-                    setCounselDraft({ counseledAt: toDateInputValue(new Date()), content: '' })
+                    setCounselDraft({
+                      counseledAt: toDateTimeLocalValue(new Date()),
+                      content: '',
+                    })
                   }
                 >
                   <Plus size={15} /> 상담 등록
@@ -414,10 +421,11 @@ export default function CurrentStudentsPage({
               ) : (
                 <>
                   <label className="field">
-                    <span>상담 날짜 *</span>
+                    <span>상담 날짜 및 시간 *</span>
                     <input
-                      type="date"
-                      value={toDateInputValue(counselDraft.counseledAt)}
+                      type="datetime-local"
+                      step="1"
+                      value={toDateTimeLocalValue(counselDraft.counseledAt)}
                       onChange={e =>
                         setCounselDraft({ ...counselDraft, counseledAt: e.target.value })
                       }
@@ -446,7 +454,7 @@ export default function CurrentStudentsPage({
                       setCounselDraft({
                         counselingId: detail.counselingId,
                         originalCounseledAt: detail.counseledAt,
-                        counseledAt: toDateInputValue(detail.counseledAt),
+                        counseledAt: toDateTimeLocalValue(detail.counseledAt),
                         content: detail.content,
                       });
                       setDetail(null);
