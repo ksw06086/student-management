@@ -12,6 +12,12 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 function makeHarness() {
   const sheets = new Map();
   const cacheValues = new Map();
+  const driveUploadMetadata = [];
+  const scriptProperties = {
+    SPREADSHEET_ID: 'test-sheet',
+    GOOGLE_CLIENT_ID: 'test-client',
+    ARCHIVE_BRIDGE_SECRET: 'test-bridge-secret',
+  };
   let currentYear = '2026';
   let googleProfile = { email: 'admin@example.com', email_verified: true, aud: 'test-client' };
   const users = new Sheet('사용자목록');
@@ -152,8 +158,10 @@ function makeHarness() {
   const context = vm.createContext({
     PropertiesService: {
       getScriptProperties: () => ({
-        getProperty: key =>
-          ({ SPREADSHEET_ID: 'test-sheet', GOOGLE_CLIENT_ID: 'test-client' })[key] || null,
+        getProperty: key => scriptProperties[key] || null,
+        setProperty: (key, value) => {
+          scriptProperties[key] = String(value);
+        },
       }),
     },
     SpreadsheetApp: { openById: () => workbook, getScriptTimeZone: () => 'UTC' },
@@ -163,11 +171,26 @@ function makeHarness() {
     },
     Utilities,
     Session: { getScriptTimeZone: () => 'UTC' },
+    ScriptApp: { getOAuthToken: () => 'test-drive-token' },
+    DriveApp: {
+      getFoldersByName: () => ({ hasNext: () => false }),
+      createFolder: () => ({ getId: () => 'test-board-folder' }),
+    },
     UrlFetchApp: {
-      fetch: () => ({
-        getResponseCode: () => 200,
-        getContentText: () => JSON.stringify(googleProfile),
-      }),
+      fetch: (url, options = {}) => {
+        const isUploadSession = String(url).includes('uploadType=resumable');
+        if (isUploadSession) driveUploadMetadata.push(JSON.parse(options.payload));
+        return {
+          getResponseCode: () => 200,
+          getContentText: () => JSON.stringify(googleProfile),
+          getAllHeaders: () =>
+            isUploadSession
+              ? {
+                  Location: `https://www.googleapis.com/upload/drive/v3/files?upload_id=${driveUploadMetadata.length}`,
+                }
+              : {},
+        };
+      },
     },
     ContentService: {
       createTextOutput: text => ({
@@ -189,6 +212,7 @@ function makeHarness() {
     call: payload => vm.runInContext(`route_(${JSON.stringify(payload)})`, context),
     userRows: users.rows,
     sheets,
+    driveUploadMetadata,
     clearCache: () => cacheValues.clear(),
     setGoogleProfile: profile => {
       googleProfile = profile;
@@ -229,8 +253,16 @@ class Sheet {
   getLastRow() {
     return this.rows.length;
   }
+  getLastColumn() {
+    return this.rows.reduce((width, row) => Math.max(width, row.length), 0);
+  }
   getDataRange() {
-    return { getValues: () => this.rows.map(row => [...row]) };
+    const width = this.getLastColumn();
+    return {
+      getValues: () => this.rows.map(row => [...row]),
+      getDisplayValues: () =>
+        this.rows.map(row => Array.from({ length: width }, (_, index) => String(row[index] ?? ''))),
+    };
   }
   getRange(row, column, rowCount = 1, columnCount = 1) {
     return {
@@ -273,6 +305,7 @@ test('Apps Script API authentication, roles, student lifecycle, statistics, logs
   const app = makeHarness();
   const adminLogin = app.call({ action: 'googleLogin', accessToken: 'mock-token' });
   assert.equal(adminLogin.ok, true, adminLogin.error || 'admin login succeeds');
+  assert.ok(adminLogin.sheets.includes('2025'));
   assert.equal(
     'authVersion' in adminLogin.user,
     false,
@@ -285,6 +318,9 @@ test('Apps Script API authentication, roles, student lifecycle, statistics, logs
     app.setGoogleProfile({ email: 'legacy@example.com', email_verified: true, aud: 'test-client' });
     const userLogin = app.call({ action: 'googleLogin', accessToken: 'mock-token' });
     assert.equal(userLogin.ok, true);
+    assert.equal(userLogin.sheets.length, 0);
+    assert.equal(app.call({ action: 'sheets', token: userLogin.token }).ok, false);
+    assert.equal(app.call({ action: 'students', token: userLogin.token, year: '2025' }).ok, false);
     assert.equal(app.call({ action: 'logs', token: userLogin.token }).ok, false);
     assert.equal(app.call({ action: 'users', token: userLogin.token }).ok, false);
     assert.equal(app.call({ action: 'users', token: adminToken }).ok, true);
@@ -304,7 +340,7 @@ test('Apps Script API authentication, roles, student lifecycle, statistics, logs
   });
 
   await t.test(
-    'protects current student reads, writes and counseling for administrators only',
+    'allows authenticated users to manage current students while keeping transfers admin-only',
     () => {
       app.setGoogleProfile({
         email: 'legacy@example.com',
@@ -312,29 +348,61 @@ test('Apps Script API authentication, roles, student lifecycle, statistics, logs
         aud: 'test-client',
       });
       const userLogin = app.call({ action: 'googleLogin', accessToken: 'mock-token' });
-      assert.equal(app.call({ action: 'currentStudents', token: userLogin.token }).ok, false);
+      const listed = app.call({ action: 'currentStudents', token: userLogin.token });
+      assert.equal(listed.ok, true);
+      assert.equal(listed.students[0].student_id, 'C001');
+      const created = app.call({
+        action: 'saveCurrentStudent',
+        token: userLogin.token,
+        create: true,
+        student: { student_id: 'C002', name: 'User Created' },
+      });
+      assert.equal(created.ok, true, created.error);
+      const userUpdated = app.call({
+        action: 'saveCurrentStudent',
+        token: userLogin.token,
+        student: { ...created.student, affiliation: '사용자 수정' },
+      });
+      assert.equal(userUpdated.ok, true, userUpdated.error);
+      assert.equal(userUpdated.student.affiliation, '사용자 수정');
+      const counseling = app.call({
+        action: 'saveCurrentCounseling',
+        token: userLogin.token,
+        studentId: 'C002',
+        counseling: { counseledAt: '2026-01-01T00:00', content: '사용자 상담 기록' },
+      });
+      assert.equal(counseling.ok, true, counseling.error);
+      const currentCounselings = app.call({
+        action: 'currentCounselings',
+        token: userLogin.token,
+        studentId: 'C002',
+      });
+      assert.equal(currentCounselings.ok, true, currentCounselings.error);
+      assert.equal(currentCounselings.counselings.length, 1);
       assert.equal(
         app.call({
-          action: 'saveCurrentStudent',
+          action: 'deleteCurrentCounseling',
           token: userLogin.token,
-          create: true,
-          student: { student_id: 'C002', name: 'Blocked' },
+          studentId: 'C002',
+          counselingId: counseling.counseling.counselingId,
         }).ok,
-        false,
+        true,
+      );
+      app.sheets.delete('\uC0C1\uB2F4\uC774\uB825');
+      assert.equal(
+        app.call({ action: 'deleteCurrentStudent', token: userLogin.token, studentId: 'C002' }).ok,
+        true,
       );
       assert.equal(
-        app.call({ action: 'currentCounselings', token: userLogin.token, studentId: 'C001' }).ok,
-        false,
+        app.call({ action: 'currentStudents', token: userLogin.token }).students.length,
+        1,
       );
       assert.equal(
-        app.call({
-          action: 'saveCurrentCounseling',
-          token: userLogin.token,
-          studentId: 'C001',
-          counseling: { counseledAt: '2026-01-01T00:00', content: 'blocked' },
-        }).ok,
+        app.call({ action: 'transferCurrentStudent', token: userLogin.token, studentId: 'C001' })
+          .ok,
         false,
       );
+      assert.equal(app.call({ action: 'users', token: userLogin.token }).ok, false);
       app.setGoogleProfile({
         email: 'admin@example.com',
         email_verified: true,
@@ -493,7 +561,7 @@ test('Apps Script API authentication, roles, student lifecycle, statistics, logs
       });
       target.failAppend = false;
       assert.equal(failed.ok, false);
-      const transferSheet = app.sheets.get('student_transfers');
+      const transferSheet = app.sheets.get('\uC7AC\uD559\uC0DD\uC878\uC5C5\uC804\uD658');
       const firstAttemptTime = transferSheet.rows.find(row => row[1] === 'C002')[4];
       assert.equal(
         app
@@ -765,7 +833,7 @@ test('Apps Script API authentication, roles, student lifecycle, statistics, logs
 
   await t.test('aggregates statistics and returns newest logs to admins', () => {
     const stats = app.call({ action: 'statistics', token: adminToken });
-    assert.equal(stats.ok, true);
+    assert.equal(stats.ok, true, stats.error);
     const yearStats = stats.statistics.find(item => item.year === '2025');
     assert.ok(yearStats);
     assert.equal(yearStats.total, 1);
@@ -1106,7 +1174,20 @@ test('Apps Script API authentication, roles, student lifecycle, statistics, logs
 test('graduate transfer creates only the server current-year tab from the latest template without copying its student rows', () => {
   const app = makeHarness();
   const login = app.call({ action: 'googleLogin', accessToken: 'mock-token' });
-  const templateHeaders = [...app.sheets.get('2025').rows[0]];
+  const templateHeaders = [
+    '\uC878\uC5C5\uC5F0\uB3C4',
+    '\uD559\uBC88',
+    '\uC774\uB984',
+    '\uC131\uBCC4',
+    '\uC804\uD654\uBC88\uD638',
+    '\uC8FC\uC18C',
+    '\uCDE8\uC5C5\uC9C4\uD559\uC0C1\uD0DC',
+    '\uD68C\uC0AC\uBA85',
+    '\uBD84\uC57C',
+    '\uC0C1\uC138\uC815\uBCF4',
+    '\uD3C9\uC810',
+    '\uC218\uC815\uC77C\uC2DC',
+  ];
   const result = app.call({
     action: 'transferCurrentStudent',
     token: login.token,
@@ -1146,18 +1227,18 @@ test('graduate transfer uses the canonical schema if no annual template exists',
   });
   assert.equal(result.ok, true, result.error);
   assert.deepEqual(app.sheets.get('2026').rows[0], [
-    'graduationYear',
-    'studentId',
-    'name',
-    'gender',
-    'phone',
-    'address',
-    'status',
-    'company',
-    'field',
-    'detail',
-    'gpa',
-    'updatedAt',
+    '\uC878\uC5C5\uC5F0\uB3C4',
+    '\uD559\uBC88',
+    '\uC774\uB984',
+    '\uC131\uBCC4',
+    '\uC804\uD654\uBC88\uD638',
+    '\uC8FC\uC18C',
+    '\uCDE8\uC5C5\uC9C4\uD559\uC0C1\uD0DC',
+    '\uD68C\uC0AC\uBA85',
+    '\uBD84\uC57C',
+    '\uC0C1\uC138\uC815\uBCF4',
+    '\uD3C9\uC810',
+    '\uC218\uC815\uC77C\uC2DC',
   ]);
 });
 
@@ -1184,8 +1265,8 @@ test('archive posts are visible to authenticated users and write operations are 
     post: { title: '  자료 안내  ', content: '첫 줄\n둘째 줄' },
   });
   assert.equal(created.ok, true, created.error);
-  assert.ok(app.sheets.has('archive_posts'));
-  assert.ok(app.sheets.has('archive_files'));
+  assert.ok(app.sheets.has('\uC790\uB8CC\uC2E4\uAC8C\uC2DC\uAE00'));
+  assert.ok(app.sheets.has('\uC790\uB8CC\uC2E4\uD30C\uC77C'));
   const posts = app.call({ action: 'archivePosts', token: admin.token });
   assert.equal(posts.posts[0].title, '자료 안내');
   assert.equal(posts.posts[0].content, '첫 줄\n둘째 줄');
@@ -1223,4 +1304,360 @@ test('archive posts are visible to authenticated users and write operations are 
     true,
   );
   assert.equal(app.call({ action: 'archivePosts', token: admin.token }).posts.length, 0);
+});
+
+test('localized archive sheet names and reordered Korean columns remain readable and writable', () => {
+  const app = makeHarness();
+  const admin = app.call({ action: 'googleLogin', accessToken: 'mock-token' });
+  const localizedName = '\uC790\uB8CC\uC2E4\uAC8C\uC2DC\uAE00';
+  const localizedHeaders = [
+    '\uC0C1\uD0DC',
+    '\uC870\uD68C\uC218',
+    '\uC218\uC815\uC77C\uC2DC',
+    '\uC0DD\uC131\uC77C\uC2DC',
+    '\uC791\uC131\uC790\uBA85',
+    '\uC791\uC131\uC790ID',
+    '\uB0B4\uC6A9',
+    '\uC81C\uBAA9',
+    '\uAC8C\uC2DC\uAE00ID',
+  ];
+  const sheet = new Sheet(localizedName);
+  sheet.rows = [
+    localizedHeaders,
+    ['active', 4, '2026-11-01', '2026-10-31', '관리자', 'admin', '내용', '기존글', 'post-existing'],
+  ];
+  app.sheets.set(localizedName, sheet);
+
+  const list = app.call({ action: 'archivePosts', token: admin.token });
+  assert.equal(list.ok, true, list.error);
+  assert.equal(list.posts[0].title, '기존글');
+  assert.equal(list.posts[0].viewCount, 4);
+
+  const saved = app.call({
+    action: 'saveArchivePost',
+    token: admin.token,
+    post: { title: '새 한글 시트 글', content: '저장 확인' },
+  });
+  assert.equal(saved.ok, true, saved.error);
+  const values = sheet.rows.at(-1);
+  assert.equal(values[localizedHeaders.indexOf('\uC81C\uBAA9')], '새 한글 시트 글');
+  assert.equal(values[localizedHeaders.indexOf('\uB0B4\uC6A9')], '저장 확인');
+});
+
+test('archive sheet name collision stops access without creating or changing either sheet', () => {
+  const app = makeHarness();
+  const admin = app.call({ action: 'googleLogin', accessToken: 'mock-token' });
+  const legacy = new Sheet('archive_posts');
+  legacy.rows = [
+    [
+      'post_id',
+      'title',
+      'content',
+      'author_id',
+      'author_name',
+      'created_at',
+      'updated_at',
+      'view_count',
+      'status',
+    ],
+  ];
+  const localized = new Sheet('\uC790\uB8CC\uC2E4\uAC8C\uC2DC\uAE00');
+  localized.rows = [
+    ['게시글ID', '제목', '내용', '작성자ID', '작성자명', '생성일시', '수정일시', '조회수', '상태'],
+  ];
+  app.sheets.set('archive_posts', legacy);
+  app.sheets.set(localized.name, localized);
+
+  const result = app.call({ action: 'archivePosts', token: admin.token });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /영문 시트와 한글 시트/);
+  assert.equal(legacy.rows.length, 1);
+  assert.equal(localized.rows.length, 1);
+});
+
+test('new boards initialize explicitly and enforce board isolation and ownership', async t => {
+  const app = makeHarness();
+  const admin = app.call({ action: 'googleLogin', accessToken: 'mock-token' });
+  assert.equal(admin.ok, true);
+  assert.equal(app.call({ action: 'boardStatus', token: admin.token }).initialized, false);
+  assert.equal(
+    app.sheets.has('\uAC8C\uC2DC\uD310\uAC8C\uC2DC\uAE00'),
+    false,
+    'reading status does not create Sheets tabs',
+  );
+
+  app.setGoogleProfile({ email: 'legacy@example.com', email_verified: true, aud: 'test-client' });
+  const user = app.call({ action: 'googleLogin', accessToken: 'mock-token' });
+  assert.equal(app.call({ action: 'initializeBoards', token: user.token }).ok, false);
+  assert.equal(
+    app.sheets.has('\uAC8C\uC2DC\uD310\uAC8C\uC2DC\uAE00'),
+    false,
+    'regular users cannot initialize board data',
+  );
+  assert.equal(app.call({ action: 'boardPosts', token: user.token, boardId: 'board_1' }).ok, false);
+
+  const initialized = app.call({ action: 'initializeBoards', token: admin.token });
+  assert.equal(initialized.ok, true, initialized.error);
+  assert.equal(
+    Array.from(initialized.created).join(','),
+    [
+      '\uAC8C\uC2DC\uD310\uAC8C\uC2DC\uAE00',
+      '\uAC8C\uC2DC\uD310\uD30C\uC77C',
+      '\uAC8C\uC2DC\uD310\uB313\uAE00',
+      '\uAC8C\uC2DC\uD310\uB313\uAE00\uC88B\uC544\uC694',
+      '\uAC8C\uC2DC\uD310\uC54C\uB9BC',
+      '\uAC8C\uC2DC\uD310\uD65C\uB3D9\uB85C\uADF8',
+    ].join(','),
+  );
+  assert.equal(app.call({ action: 'boardStatus', token: admin.token }).initialized, true);
+
+  const first = app.call({
+    action: 'saveBoardPost',
+    token: user.token,
+    post: { boardId: 'board_1', title: 'Board one', content: 'hello' },
+  });
+  const second = app.call({
+    action: 'saveBoardPost',
+    token: user.token,
+    post: { boardId: 'board_2', title: 'Board two', content: 'separate' },
+  });
+  assert.equal(first.ok, true, first.error);
+  assert.equal(second.ok, true, second.error);
+  assert.equal(app.call({ action: 'boardPosts', token: user.token, boardId: 'board_1' }).total, 1);
+  assert.equal(app.call({ action: 'boardPosts', token: user.token, boardId: 'board_2' }).total, 1);
+  assert.equal(app.call({ action: 'boardPosts', token: user.token, boardId: 'photo' }).total, 0);
+
+  const other = app.call({
+    action: 'saveBoardPost',
+    token: admin.token,
+    post: { boardId: 'board_1', title: 'Admin post', content: '' },
+  });
+  assert.equal(
+    app.call({
+      action: 'bulkBoardPosts',
+      token: admin.token,
+      actionType: 'move',
+      postIds: [other.postId],
+      targetBoardId: 'board_3',
+    }).ok,
+    true,
+  );
+  assert.equal(app.call({ action: 'boardPosts', token: admin.token, boardId: 'board_3' }).total, 1);
+  assert.equal(
+    app.call({
+      action: 'bulkBoardPosts',
+      token: admin.token,
+      actionType: 'move',
+      postIds: [other.postId],
+      targetBoardId: 'photo',
+    }).ok,
+    false,
+    'photo board rejects posts without an image',
+  );
+  assert.equal(
+    app.call({
+      action: 'saveBoardPost',
+      token: user.token,
+      post: { boardId: 'board_1', postId: other.postId, title: 'Tamper', content: '' },
+    }).ok,
+    false,
+    'users cannot edit another author’s post',
+  );
+  assert.equal(
+    app.call({ action: 'deleteBoardPost', token: user.token, postId: other.postId }).ok,
+    false,
+  );
+  assert.equal(
+    app.call({ action: 'restoreBoardPost', token: user.token, postId: first.postId }).ok,
+    false,
+  );
+  assert.equal(
+    app.call({
+      action: 'saveBoardPost',
+      token: user.token,
+      post: { boardId: 'board_1', postId: first.postId, title: 'Owner edit', content: 'updated' },
+    }).ok,
+    true,
+    'authors can edit their own post',
+  );
+
+  const comment = app.call({
+    action: 'saveBoardComment',
+    token: user.token,
+    comment: { postId: first.postId, content: 'first comment' },
+  });
+  assert.equal(comment.ok, true, comment.error);
+  const reply = app.call({
+    action: 'saveBoardComment',
+    token: admin.token,
+    comment: { postId: first.postId, parentId: comment.commentId, content: 'reply' },
+  });
+  assert.equal(reply.ok, true, reply.error);
+  assert.equal(
+    app.call({
+      action: 'toggleBoardCommentLike',
+      token: admin.token,
+      commentId: comment.commentId,
+    }).ok,
+    true,
+  );
+  assert.equal(
+    app.call({
+      action: 'deleteBoardComment',
+      token: admin.token,
+      commentId: reply.commentId,
+    }).ok,
+    true,
+    'admins can moderate any comment',
+  );
+  assert.equal(
+    app.call({ action: 'boardNotifications', token: user.token }).notifications.length,
+    1,
+  );
+  assert.equal(
+    app.call({
+      action: 'setBoardCommentLock',
+      token: admin.token,
+      postId: first.postId,
+      locked: true,
+    }).ok,
+    true,
+  );
+  assert.equal(
+    app.call({
+      action: 'saveBoardComment',
+      token: user.token,
+      comment: { postId: first.postId, content: 'blocked while locked' },
+    }).ok,
+    false,
+  );
+  assert.equal(
+    app.call({ action: 'deleteBoardPost', token: user.token, postId: first.postId }).ok,
+    true,
+  );
+  assert.equal(
+    app.call({
+      action: 'boardPosts',
+      token: admin.token,
+      boardId: 'board_1',
+      includeDeleted: true,
+    }).total,
+    1,
+  );
+  assert.equal(
+    app.call({ action: 'restoreBoardPost', token: admin.token, postId: first.postId }).ok,
+    true,
+  );
+});
+
+test('board initialization refuses to overwrite incompatible existing headers', () => {
+  const app = makeHarness();
+  const login = app.call({ action: 'googleLogin', accessToken: 'mock-token' });
+  const existing = new Sheet('board_posts');
+  existing.rows = [
+    ['post_id', 'unexpected_column'],
+    ['keep', 'this data'],
+  ];
+  app.sheets.set('board_posts', existing);
+  const status = app.call({ action: 'boardStatus', token: login.token });
+  assert.equal(status.initialized, false);
+  assert.equal(Array.from(status.invalid).join(','), '\uAC8C\uC2DC\uD310\uAC8C\uC2DC\uAE00');
+  const result = app.call({ action: 'initializeBoards', token: login.token });
+  assert.equal(result.ok, false);
+  assert.deepEqual(existing.rows, [
+    ['post_id', 'unexpected_column'],
+    ['keep', 'this data'],
+  ]);
+  assert.equal(
+    app.sheets.has('\uAC8C\uC2DC\uD310\uD30C\uC77C'),
+    false,
+    'validation runs before adding other tabs',
+  );
+});
+
+test('board upload sessions preserve client IDs and reject duplicate IDs', () => {
+  const app = makeHarness();
+  const login = app.call({ action: 'googleLogin', accessToken: 'mock-token' });
+  assert.equal(app.call({ action: 'initializeBoards', token: login.token }).ok, true);
+  const post = app.call({
+    action: 'saveBoardPost',
+    token: login.token,
+    post: { boardId: 'photo', title: 'Photo draft', content: '', publish: false },
+  });
+  assert.equal(post.ok, true, post.error);
+
+  const upload = app.call({
+    action: 'boardUploadStart',
+    token: login.token,
+    bridgeSecret: 'test-bridge-secret',
+    boardId: 'photo',
+    postId: post.postId,
+    files: [
+      {
+        clientId: 'client-photo-1',
+        name: '행사 사진 (가족).jpg',
+        size: 8,
+        mimeType: 'image/jpeg',
+      },
+      {
+        clientId: 'client-photo-2',
+        name: '행사 사진 (가족).jpg',
+        size: 8,
+        mimeType: 'image/jpeg',
+      },
+    ],
+  });
+  assert.equal(upload.ok, true, upload.error);
+  assert.equal(upload.uploads[0].clientId, 'client-photo-1');
+  assert.equal(upload.uploads[0].postId, post.postId);
+  assert.equal(upload.uploads[0].boardId, 'photo');
+  assert.equal(upload.uploads[1].clientId, 'client-photo-2');
+  assert.notEqual(upload.uploads[0].fileId, upload.uploads[1].fileId);
+  assert.deepEqual(
+    app.driveUploadMetadata.map(metadata => metadata.name),
+    ['행사 사진 (가족).jpg', '행사 사진 (가족).jpg'],
+  );
+
+  const duplicateIds = app.call({
+    action: 'boardUploadStart',
+    token: login.token,
+    bridgeSecret: 'test-bridge-secret',
+    boardId: 'photo',
+    postId: post.postId,
+    files: [
+      { clientId: 'same-id', name: 'one.png', size: 8, mimeType: 'image/png' },
+      { clientId: 'same-id', name: 'two.png', size: 8, mimeType: 'image/png' },
+    ],
+  });
+  assert.equal(duplicateIds.ok, false);
+  assert.match(duplicateIds.error, /식별 정보/);
+});
+
+test('archive Drive upload metadata keeps safe Korean original filenames', () => {
+  const app = makeHarness();
+  const login = app.call({ action: 'googleLogin', accessToken: 'mock-token' });
+  const post = app.call({
+    action: 'saveArchivePost',
+    token: login.token,
+    post: { title: 'Archive filename test', content: '' },
+  });
+  assert.equal(post.ok, true, post.error);
+
+  const upload = app.call({
+    action: 'archiveUploadStart',
+    token: login.token,
+    bridgeSecret: 'test-bridge-secret',
+    postId: post.postId,
+    files: [
+      {
+        name: '회의 자료 (최종) 2026.pdf',
+        size: 8,
+        mimeType: 'application/pdf',
+      },
+    ],
+  });
+  assert.equal(upload.ok, true, upload.error);
+  assert.equal(upload.uploads[0].originalFilename, '회의 자료 (최종) 2026.pdf');
+  assert.equal(upload.uploads[0].storedFilename, '회의 자료 (최종) 2026.pdf');
+  assert.equal(app.driveUploadMetadata[0].name, '회의 자료 (최종) 2026.pdf');
 });

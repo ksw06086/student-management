@@ -228,3 +228,64 @@ test('Cloudflare Worker archive upload sessions and bounded chunk proxy', async 
     }
   });
 });
+
+test('Cloudflare Worker board upload cancellation aborts Drive and protects session ownership', async () => {
+  const values = new Map([
+    [
+      'board-upload:board-file',
+      JSON.stringify({
+        uploadId: 'board-file',
+        token: 'owner-token',
+        sessionUrl: 'https://www.googleapis.com/upload/drive/v3/files?upload_id=private',
+      }),
+    ],
+  ]);
+  const kv = {
+    get: async key => values.get(key) || null,
+    put: async (key, value) => values.set(key, value),
+    delete: async key => values.delete(key),
+  };
+  const originalFetch = globalThis.fetch;
+  let abortedUrl = '';
+  globalThis.fetch = async (url, init) => {
+    abortedUrl = `${url}:${init.method}`;
+    return new Response(null, { status: 200 });
+  };
+  try {
+    const unauthorized = await worker.fetch(
+      new Request('https://worker.example/boards/cancel', {
+        method: 'POST',
+        headers: {
+          Origin: origin,
+          'X-Upload-Id': 'board-file',
+          'X-Session-Token': 'other-token',
+        },
+      }),
+      { ...env, ARCHIVE_UPLOADS: kv },
+    );
+    assert.equal(unauthorized.status, 403);
+    assert.equal(values.has('board-upload:board-file'), true);
+
+    const canceled = await worker.fetch(
+      new Request('https://worker.example/boards/cancel', {
+        method: 'POST',
+        headers: {
+          Origin: origin,
+          'X-Upload-Id': 'board-file',
+          'X-Session-Token': 'owner-token',
+        },
+      }),
+      { ...env, ARCHIVE_UPLOADS: kv },
+    );
+    assert.equal(canceled.status, 200);
+    assert.equal(
+      abortedUrl.startsWith(
+        'https://www.googleapis.com/upload/drive/v3/files?upload_id=private:DELETE',
+      ),
+      true,
+    );
+    assert.equal(values.has('board-upload:board-file'), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
