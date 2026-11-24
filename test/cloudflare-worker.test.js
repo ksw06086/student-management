@@ -157,13 +157,14 @@ test('photo-board list reuses authorized preview metadata from the first Apps Sc
     return new Response(JSON.stringify({
       ok: true,
       boardId: 'photo',
-      posts: [{ postId: 'photo-post', coverFileId: 'photo-file' }],
+      posts: [{ postId: 'photo-post', coverFileId: 'photo-file', files: [{ fileId: 'photo-file', fileType: 'image' }] }],
       total: 1,
       previewAccess: {
         driveToken: 'private-drive-token',
         files: [{
           fileId: 'photo-file',
           driveFileId: 'drive-file',
+          thumbnailDriveFileId: 'thumb-drive-file',
           filename: '행사.jpg',
           mimeType: 'image/jpeg',
         }],
@@ -184,9 +185,56 @@ test('photo-board list reuses authorized preview metadata from the first Apps Sc
     assert.equal(calls, 1, 'the separate boardPreviewInfo action is not needed');
     assert.equal(forwardedPayload.includePreviewAccess, true);
     assert.match(result.posts[0].previewUrl, /\/boards\/preview\//);
+    assert.match(result.posts[0].files[0].previewUrl, /\/boards\/preview\//);
+    assert.match(result.posts[0].files[0].originalPreviewUrl, /original=1/);
     assert.equal('previewAccess' in result, false);
     const ticketValue = [...values.values()][0];
     assert.equal(JSON.parse(ticketValue).driveToken, 'private-drive-token');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('photo preview serves stored thumbnails by default and preserves the original-image route', async () => {
+  const originalFetch = globalThis.fetch;
+  const requested = [];
+  const values = new Map([[
+    'board-preview:test-ticket',
+    JSON.stringify({
+      driveToken: 'private-token',
+      files: {
+        'logical-file': {
+          driveFileId: 'original-drive-id',
+          thumbnailDriveFileId: 'thumbnail-drive-id',
+          mimeType: 'image/png',
+          thumbnailMimeType: 'image/jpeg',
+          filename: 'photo.png',
+        },
+      },
+    }),
+  ]]);
+  globalThis.fetch = async url => {
+    requested.push(String(url));
+    return new Response(new Uint8Array([1, 2, 3]), { headers: { 'Content-Type': 'image/jpeg' } });
+  };
+  try {
+    const kv = { get: async key => values.get(key) || null };
+    const base = { ...env, ARCHIVE_UPLOADS: kv };
+    const thumbnail = await worker.fetch(
+      new Request('https://worker.example/boards/preview/test-ticket/logical-file', { headers: { Origin: origin } }),
+      base,
+    );
+    assert.equal(thumbnail.status, 200);
+    assert.equal(thumbnail.headers.get('Content-Type'), 'image/jpeg');
+    const original = await worker.fetch(
+      new Request('https://worker.example/boards/preview/test-ticket/logical-file?original=1', { headers: { Origin: origin } }),
+      base,
+    );
+    assert.equal(original.status, 200);
+    assert.deepEqual(requested, [
+      'https://www.googleapis.com/drive/v3/files/thumbnail-drive-id?alt=media',
+      'https://www.googleapis.com/drive/v3/files/original-drive-id?alt=media',
+    ]);
   } finally {
     globalThis.fetch = originalFetch;
   }

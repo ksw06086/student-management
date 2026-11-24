@@ -77,10 +77,12 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
   const [selectedIds, setSelectedIds] = useState([]);
   const [moveTarget, setMoveTarget] = useState('board_1');
   const [detail, setDetail] = useState(null);
+  const [feedCommentsPostId, setFeedCommentsPostId] = useState('');
   const [detailLoading, setDetailLoading] = useState(false);
   const [previews, setPreviews] = useState({});
   const [documentPreview, setDocumentPreview] = useState(null);
   const [lightboxIndex, setLightboxIndex] = useState(-1);
+  const [lightboxFiles, setLightboxFiles] = useState(null);
   const [draft, setDraft] = useState(null);
   const [pendingFiles, setPendingFiles] = useState([]);
   const [removedFileIds, setRemovedFileIds] = useState([]);
@@ -103,6 +105,9 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
   const touchStartRef = useRef(null);
   const listRequestRef = useRef(0);
   const loadedListKeyRef = useRef('');
+  const postsRef = useRef([]);
+  const previewOwnerRef = useRef(auth.token);
+  const imageLoadStartedAtRef = useRef(new Map());
 
   const board = BOARD_DEFINITIONS.find(item => item.id === boardId) || BOARD_DEFINITIONS[0];
   const draftStorageKey = `${BOARD_DRAFT_KEY}:${auth.user.userId}:${boardId}:${draft?.postId || 'new'}`;
@@ -150,7 +155,28 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
         includeDrafts: view === 'drafts',
       });
       if (requestId !== listRequestRef.current) return;
-      setPosts(result.posts || []);
+      const oldPreviews = new Map();
+      if (previewOwnerRef.current === auth.token) {
+        postsRef.current.forEach(post => (post.files || []).forEach(file => {
+          if (file.previewUrl && file.previewExpiresAt > Date.now() + 30000)
+            oldPreviews.set(file.fileId, file);
+        }));
+      }
+      const nextPosts = (result.posts || []).map(post => ({
+        ...post,
+        files: (post.files || []).map(file => {
+          const old = oldPreviews.get(file.fileId);
+          return old
+            ? { ...file, previewUrl: old.previewUrl, originalPreviewUrl: old.originalPreviewUrl, previewExpiresAt: old.previewExpiresAt }
+            : file;
+        }),
+      }));
+      nextPosts.forEach(post => (post.files || []).forEach(file => {
+        if (!imageLoadStartedAtRef.current.has(file.fileId))
+          imageLoadStartedAtRef.current.set(file.fileId, performance.now());
+      }));
+      postsRef.current = nextPosts;
+      setPosts(nextPosts);
       setTotal(result.total || 0);
       loadedListKeyRef.current = requestKey;
       setLoadedListKey(requestKey);
@@ -179,6 +205,19 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
     loadStatus();
   }, [loadStatus]);
   useEffect(() => {
+    postsRef.current = posts;
+  }, [posts]);
+  useEffect(() => {
+    previewOwnerRef.current = auth.token;
+    postsRef.current = [];
+    setPosts([]);
+    setPreviews({});
+    setDetail(null);
+    setFeedCommentsPostId('');
+    loadedListKeyRef.current = '';
+    setLoadedListKey('');
+  }, [auth.token]);
+  useEffect(() => {
     loadList();
     return () => {
       listRequestRef.current += 1;
@@ -192,13 +231,15 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
   }, [initialized, loadNotifications]);
   useEffect(() => {
     if (!isPhoto || !posts.length) return;
-    const listPreviews = Object.fromEntries(
-      posts
-        .filter(post => post.coverFileId && post.previewUrl)
-        .map(post => [post.coverFileId, post.previewUrl]),
-    );
+    const listPreviews = Object.fromEntries(posts.flatMap(post =>
+      (post.files || [])
+        .filter(file => isBoardImageFile(file) && file.previewUrl)
+        .map(file => [file.fileId, file.previewUrl]),
+    ));
     if (Object.keys(listPreviews).length)
-      setPreviews(current => ({ ...current, ...listPreviews }));
+      setPreviews(current => Object.entries(listPreviews).every(([id, url]) => current[id] === url)
+        ? current
+        : { ...current, ...listPreviews });
   }, [isPhoto, posts]);
   useEffect(() => {
     if (!detail) return;
@@ -260,8 +301,8 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
   }, [api, auth.token, notify, view]);
 
   const galleryImages = useMemo(
-    () => (detail?.files || []).filter(isBoardImageFile).sort((a, b) => a.sortOrder - b.sortOrder),
-    [detail],
+    () => (lightboxFiles || detail?.files || []).filter(isBoardImageFile).sort((a, b) => a.sortOrder - b.sortOrder),
+    [detail, lightboxFiles],
   );
   const sortedComments = useMemo(() => {
     const items = [...(detail?.comments || [])];
@@ -306,6 +347,37 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
   }
 
   async function openPost(post, selectedBoardId = boardId) {
+    if (selectedBoardId === 'photo') {
+      if (boardId !== 'photo' || view !== 'list' || !postsRef.current.some(item => item.postId === post.postId)) {
+        setBoardId('photo');
+        setPage(1);
+        setView('list');
+        setDetail(null);
+        setFeedCommentsPostId('');
+        setFilters(current => ({ ...current, query: '', authorName: '' }));
+        setAppliedFilters(current => ({ ...current, query: '', authorName: '' }));
+        return;
+      }
+      setBoardId('photo');
+      setFeedCommentsPostId(post.postId);
+      setDetail(null);
+      setDetailLoading(true);
+      try {
+        const result = await api('boardComments', {
+          token: auth.token,
+          boardId: 'photo',
+          postId: post.postId,
+        });
+        setDetail(result.post);
+      } catch (error) {
+        notify(error.message, 'error');
+      } finally {
+        setDetailLoading(false);
+      }
+      return;
+    }
+    setFeedCommentsPostId('');
+    setLightboxFiles(null);
     setBoardId(selectedBoardId);
     setMoveTarget(selectedBoardId);
     setDetailLoading(true);
@@ -341,6 +413,7 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
     setView('editor');
     const initial = post
       ? {
+          ...post,
           postId: post.postId,
           boardId,
           title: post.title,
@@ -483,7 +556,7 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
     });
   }
 
-  async function uploadOne(upload, file) {
+  async function uploadOne(upload, file, taskId) {
     // 각 파일을 8MiB 이하 Blob 청크로 나누어 순차 전송하고 Worker가 돌려준 실제 수신 위치로 이어갑니다.
     let offset = 0;
     setActiveUploadId(upload.uploadId);
@@ -495,6 +568,7 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
           {
             uploadId: upload.uploadId,
             token: auth.token,
+            taskId,
             start: offset,
             chunk,
             onProgress: sent =>
@@ -521,7 +595,61 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
     throw new Error('업로드가 완료되지 않았습니다. 파일을 다시 선택해 이어서 진행해 주세요.');
   }
 
-  async function uploadPending(postId) {
+  async function uploadPhotoThumbnail(sourceFile, uploadedFile, postId, taskId) {
+    if (!isPhoto || typeof createImageBitmap !== 'function' || typeof File !== 'function') return;
+    const startedAt = performance.now();
+    let thumbnailSession;
+    let outcome = 'ok';
+    try {
+      const bitmap = await createImageBitmap(sourceFile, { imageOrientation: 'from-image' });
+      const ratio = Math.min(1, 600 / Math.max(bitmap.width, bitmap.height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.round(bitmap.width * ratio));
+      canvas.height = Math.max(1, Math.round(bitmap.height * ratio));
+      const context = canvas.getContext('2d', { alpha: false });
+      if (!context) throw new Error('썸네일 캔버스를 사용할 수 없습니다.');
+      context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      bitmap.close?.();
+      const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.82));
+      if (!blob || !blob.size) throw new Error('썸네일 이미지를 만들지 못했습니다.');
+      const thumbnail = new File([blob], `thumbnail-${uploadedFile.fileId}.jpg`, { type: 'image/jpeg' });
+      const clientId = `thumbnail-${uploadedFile.fileId}`;
+      const result = await api('boardUploadStart', {
+        token: auth.token,
+        taskId,
+        boardId,
+        postId,
+        files: [{
+          clientId,
+          name: thumbnail.name,
+          size: thumbnail.size,
+          mimeType: 'image/jpeg',
+          isCover: false,
+          thumbnailForFileId: uploadedFile.fileId,
+        }],
+      });
+      thumbnailSession = result.uploads?.[0];
+      if (!thumbnailSession) throw new Error('썸네일 업로드 세션을 만들지 못했습니다.');
+      await uploadOne(thumbnailSession, thumbnail, taskId);
+    } catch (error) {
+      outcome = 'fallback_to_original';
+      // 썸네일이 실패해도 원본 게시물은 사용할 수 있으며 목록에서는 원본 미리보기를 사용합니다.
+      if (thumbnailSession) {
+        setFailedUploadIds(current => current.filter(id => id !== thumbnailSession.uploadId));
+        try {
+          await fetch(`${API_URL}/boards/cancel`, {
+            method: 'POST',
+            headers: { 'X-Upload-Id': thumbnailSession.uploadId, 'X-Session-Token': auth.token },
+          });
+        } catch (_) {}
+      }
+      console.warn('Photo feed thumbnail generation failed', error?.message || error);
+    } finally {
+      logUiTiming('photo_board', 'thumbnail_create_upload', startedAt, outcome);
+    }
+  }
+
+  async function uploadPending(postId, taskId) {
     const matchingSession = (item, session) =>
       boardUploadSessionMatches(session, item.clientId, boardId, postId);
     const newFiles = pendingFiles.filter(
@@ -531,6 +659,7 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
     if (newFiles.length) {
       const result = await api('boardUploadStart', {
         token: auth.token,
+        taskId,
         boardId,
         postId,
         files: newFiles.map(item => ({
@@ -555,10 +684,11 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
         throw new Error(
           `${item.file.name}: 업로드 세션을 준비하지 못했습니다. 다시 시도해 주세요.`,
         );
-      const file = await uploadOne(session, item.file);
+      const file = await uploadOne(session, item.file, taskId);
       if (!file?.fileId || (isPhoto && file.fileType !== 'image'))
         throw new Error(`${item.file.name}: 서버에 저장된 사진 정보를 확인하지 못했습니다.`);
       uploaded.push({ ...file, clientId: item.clientId });
+      if (isPhoto) await uploadPhotoThumbnail(item.file, file, postId, taskId);
       setFailedUploadIds(current => current.filter(id => id !== session.uploadId));
       setDraft(current => {
         if (!current) return current;
@@ -593,6 +723,7 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
 
   async function saveEditor(publish) {
     if (!draft || saving) return;
+    const taskId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
     const title = String(draft.title || '').trim();
     if (!title) return notify('제목을 입력해 주세요.', 'warning');
     if (isPhoto && String(draft.content || '').length > 200)
@@ -629,16 +760,19 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
         'warning',
       );
     }
+    const saveStartedAt = performance.now();
+    let saveOutcome = 'ok';
     setSaving(true);
     try {
       const result = await api('saveBoardPost', {
         token: auth.token,
+        taskId,
         post: {
           postId: draft.postId,
           boardId,
           title,
           content: String(draft.content || ''),
-          publish: false,
+          publish: !draft.postId && publish && pendingFiles.length === 0,
           isNotice: draft.isNotice,
           isPinned: draft.isPinned,
           isImportant: draft.isImportant,
@@ -646,7 +780,7 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
       });
       const postId = result.postId;
       if (!draft.postId) setDraft(current => ({ ...current, postId, status: 'draft' }));
-      const uploaded = await uploadPending(postId);
+      const uploaded = await uploadPending(postId, taskId);
       for (const fileId of removedFileIds)
         await api('deleteBoardFile', { token: auth.token, fileId });
       const remaining = draft.existingFiles
@@ -690,8 +824,8 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
         );
         if (coverId) await api('setBoardCoverFile', { token: auth.token, postId, fileId: coverId });
       }
-      if (publish && draft.status !== 'active')
-        await api('publishBoardPost', { token: auth.token, postId });
+      if (publish && draft.status !== 'active' && result.status !== 'active')
+        await api('publishBoardPost', { token: auth.token, postId, taskId });
       try {
         localStorage.removeItem(draftStorageKey);
         localStorage.removeItem(`${BOARD_DRAFT_KEY}:${auth.user.userId}:${boardId}:${postId}`);
@@ -701,10 +835,33 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
       setUploadSessions([]);
       setRemovedFileIds([]);
       setSaving(false);
+      if (isPhoto) {
+        notify(publish
+          ? draft.status === 'active' ? '게시글을 수정했습니다.' : '게시글을 등록했습니다.'
+          : '사진 게시글을 저장했습니다.');
+        setFeedCommentsPostId('');
+        setDetail(null);
+        setView(draft.status === 'active' || publish ? 'list' : 'drafts');
+        return;
+      }
       if (publish) {
         notify(draft.status === 'active' ? '게시글을 수정했습니다.' : '게시글을 등록했습니다.');
-        const opened = await api('boardPost', { token: auth.token, boardId, postId });
-        setDetail(opened.post);
+        if (result.post && uploaded.length === 0 && removedFileIds.length === 0) {
+          setDetail({ ...result.post, canManage: true, comments: [] });
+        } else if (draft.status === 'active' && uploaded.length === 0 && removedFileIds.length === 0) {
+          setDetail({
+            ...draft,
+            title,
+            content: String(draft.content || ''),
+            updatedAt: result.updatedAt || draft.updatedAt,
+            files: draft.existingFiles || [],
+            canManage: true,
+            comments: draft.comments || [],
+          });
+        } else {
+          const opened = await api('boardPost', { token: auth.token, boardId, postId, taskId });
+          setDetail(opened.post);
+        }
         setView('detail');
       } else if (draft.status === 'active') {
         notify('게시글 수정 내용을 저장했습니다.');
@@ -716,9 +873,11 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
         setView('drafts');
       }
     } catch (error) {
+      saveOutcome = 'error';
       notify(error.message, 'error');
     } finally {
       setSaving(false);
+      logUiTiming(isPhoto ? 'photo_board' : 'boards', 'save_post_flow', saveStartedAt, saveOutcome);
     }
   }
 
@@ -746,12 +905,12 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
     }
   }
 
-  async function downloadAllFiles() {
+  async function downloadAllFiles(postId = detail?.postId) {
     try {
       const result = await api('boardZipDownload', {
         token: auth.token,
         boardId,
-        postId: detail.postId,
+        postId,
       });
       window.location.assign(result.downloadUrl);
     } catch (error) {
@@ -773,11 +932,38 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
     }
   }
 
+  async function refreshImagePreview(fileId) {
+    const result = await api('boardImagePreviews', { token: auth.token, fileIds: [fileId] });
+    const previewUrl = result.previews?.[fileId];
+    if (!previewUrl) throw new Error('사진 미리보기 주소를 다시 발급하지 못했습니다.');
+    const previewExpiresAt = Date.now() + 300000;
+    setPreviews(current => ({ ...current, [fileId]: previewUrl }));
+    setPosts(current => current.map(post => ({
+      ...post,
+      files: (post.files || []).map(file => file.fileId === fileId
+        ? { ...file, previewUrl, originalPreviewUrl: `${previewUrl}?original=1`, previewExpiresAt }
+        : file),
+    })));
+    setLightboxFiles(current => current
+      ? current.map(file => file.fileId === fileId
+        ? { ...file, previewUrl, originalPreviewUrl: `${previewUrl}?original=1`, previewExpiresAt }
+        : file)
+      : current);
+    return previewUrl;
+  }
+
   async function deletePost(post) {
     if (!window.confirm(`“${post.title}” 게시글을 삭제함으로 이동할까요?`)) return;
     try {
       await api('deleteBoardPost', { token: auth.token, postId: post.postId });
       notify('게시글을 삭제함으로 이동했습니다.');
+      if (boardId === 'photo' && view === 'list') {
+        setPosts(current => current.filter(item => item.postId !== post.postId));
+        setTotal(current => Math.max(0, current - 1));
+        if (feedCommentsPostId === post.postId) { setFeedCommentsPostId(''); setDetail(null); }
+        if (visiblePosts.length === 1 && page > 1) setPage(current => current - 1);
+        return;
+      }
       if (view === 'detail') {
         setDetail(null);
         setView('list');
@@ -861,9 +1047,13 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
     event.preventDefault();
     const content = commentText;
     if (!String(content || '').trim()) return;
+    const taskId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
+    const saveStartedAt = performance.now();
+    let saveOutcome = 'ok';
     try {
-      await api('saveBoardComment', {
+      const result = await api('saveBoardComment', {
         token: auth.token,
+        taskId,
         comment: {
           postId: detail.postId,
           parentId: editingComment?.parentId || replyTo?.commentId || '',
@@ -874,21 +1064,47 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
       setCommentText('');
       setReplyTo(null);
       setEditingComment(null);
-      const result = await api('boardPost', { token: auth.token, boardId, postId: detail.postId });
-      setDetail(result.post);
-      loadNotifications();
+      if (result.comment) {
+        setDetail(current => {
+          if (!current || current.postId !== result.comment.postId) return current;
+          const found = current.comments.some(item => item.commentId === result.comment.commentId);
+          return {
+            ...current,
+            comments: found
+              ? current.comments.map(item => item.commentId === result.comment.commentId ? result.comment : item)
+              : [...current.comments, result.comment],
+            commentCount: result.commentCount ?? current.commentCount,
+          };
+        });
+        setPosts(current => current.map(post => post.postId === result.comment.postId
+          ? { ...post, commentCount: result.commentCount ?? post.commentCount }
+          : post));
+      }
       notify(editingComment ? '댓글을 수정했습니다.' : '댓글을 등록했습니다.');
     } catch (error) {
+      saveOutcome = 'error';
       notify(error.message, 'error');
+    } finally {
+      logUiTiming('boards', 'save_comment_flow', saveStartedAt, saveOutcome);
     }
   }
 
   async function removeComment(comment) {
     if (!window.confirm('댓글을 삭제할까요?')) return;
     try {
-      await api('deleteBoardComment', { token: auth.token, commentId: comment.commentId });
-      const result = await api('boardPost', { token: auth.token, boardId, postId: detail.postId });
-      setDetail(result.post);
+      const result = await api('deleteBoardComment', { token: auth.token, commentId: comment.commentId });
+      setDetail(current => {
+        if (!current || current.postId !== result.postId) return current;
+        const comments = result.hasReplies
+          ? current.comments.map(item => item.commentId === result.commentId
+            ? { ...item, status: 'deleted', content: result.content }
+            : item)
+          : current.comments.filter(item => item.commentId !== result.commentId);
+        return { ...current, comments, commentCount: result.commentCount ?? current.commentCount };
+      });
+      setPosts(current => current.map(post => post.postId === result.postId
+        ? { ...post, commentCount: result.commentCount ?? post.commentCount }
+        : post));
       notify('댓글을 삭제했습니다.');
     } catch (error) {
       notify(error.message, 'error');
@@ -1183,7 +1399,9 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
     return (
       <div className="board-photo-grid">
         {visiblePosts.map(post => {
-          const imageUrl = previews[post.coverFileId] || post.previewUrl || '';
+          const images = [...(post.files || [])]
+            .filter(isBoardImageFile)
+            .sort((a, b) => a.sortOrder - b.sortOrder);
           return (
             <article className="board-photo-entry" key={post.postId}>
               {isAdmin && view === 'list' && (
@@ -1195,38 +1413,101 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
                   onChange={() => toggleSelected(post.postId)}
                 />
               )}
-              <button
-                className="board-photo-card"
-                onClick={() => (view === 'drafts' ? openEditor(post) : openPost(post))}
-              >
-                <span className="board-photo-thumb">
-                  {imageUrl ? (
-                    <img
-                      src={imageUrl}
-                      alt=""
-                      loading="lazy"
-                      onError={event => {
-                        event.currentTarget.style.display = 'none';
-                      }}
-                    />
-                  ) : (
-                    <Image size={34} aria-hidden="true" />
-                  )}
+              <div className="photo-feed-card">
+                <header className="photo-feed-meta">
+                  <div><b>{post.authorName}</b><time>{formatKoreanDateTime(post.createdAt) || '-'}</time></div>
                   {renderMarkers(post)}
-                </span>
-                <span className="board-photo-card-body">
-                  <strong>{renderHighlight(post.title, appliedFilters.query)}</strong>
-                  <span className="board-photo-excerpt">
-                    {post.content || '사진 설명이 없습니다.'}
-                  </span>
-                  <small>
-                    {post.authorName} · {formatKoreanDateTime(post.createdAt) || '-'}
-                  </small>
-                  <small>
-                    조회 {post.viewCount} · 댓글 {post.commentCount}
-                  </small>
-                </span>
-              </button>
+                </header>
+                <h3>{renderHighlight(post.title, appliedFilters.query)}</h3>
+                <p className="photo-feed-content">{post.content || '사진 설명이 없습니다.'}</p>
+                {!!images.length ? (
+                  <div className={`photo-feed-images count-${Math.min(images.length, 5)}`}>
+                    {images.map((file, index) => (
+                      <button
+                        className="photo-feed-image"
+                        key={file.fileId}
+                        type="button"
+                        onClick={() => { setLightboxFiles(images); setLightboxIndex(index); }}
+                        aria-label={`${post.title} 사진 ${index + 1} 확대`}
+                      >
+                        <img
+                          src={previews[file.fileId] || file.previewUrl || ''}
+                          alt={file.originalFilename || ''}
+                          loading="lazy"
+                          decoding="async"
+                          onLoad={() => {
+                            const startedAt = imageLoadStartedAtRef.current.get(file.fileId);
+                            if (startedAt != null) {
+                              logUiTiming('photo_board', 'feed_image_loaded', startedAt);
+                              imageLoadStartedAtRef.current.delete(file.fileId);
+                            }
+                          }}
+                          onError={event => {
+                            const image = event.currentTarget;
+                            if (!image.dataset.refreshed) {
+                              image.dataset.refreshed = 'true';
+                              refreshImagePreview(file.fileId).catch(() => {
+                                image.dataset.failed = 'true';
+                                image.parentElement.dataset.failed = 'true';
+                              });
+                            } else {
+                              image.dataset.failed = 'true';
+                              image.parentElement.dataset.failed = 'true';
+                            }
+                          }}
+                        />
+                      </button>
+                    ))}
+                  </div>
+                ) : <div className="photo-feed-no-image"><Image size={28} /> 등록된 사진이 없습니다.</div>}
+                <div className="photo-feed-count">사진 {images.length}장</div>
+                {!!images.length && <div className="photo-feed-image-downloads">
+                  {images.map((file, index) => <button key={file.fileId} type="button" onClick={() => downloadFile(file)}>
+                    <Download size={13} /> 사진 {index + 1} 원본 다운로드
+                  </button>)}
+                </div>}
+                <div className="photo-feed-actions">
+                  <button type="button" onClick={() => {
+                    if (feedCommentsPostId === post.postId) {
+                      setFeedCommentsPostId(''); setDetail(null);
+                    } else openPost(post, 'photo');
+                  }}><MessageCircle size={15} /> 댓글 {post.commentCount || 0}</button>
+                  {images.length > 1 && <button type="button" onClick={() => downloadAllFiles(post.postId)}><FileArchive size={15} /> 전체 다운로드</button>}
+                  {isAdmin && feedCommentsPostId === post.postId && <button type="button" onClick={toggleCommentLock}>
+                    <LockKeyhole size={14} /> 댓글 {detail?.commentsLocked ? '잠금 해제' : '잠금'}
+                  </button>}
+                  {isAdmin && <select className="board-detail-move-select" value={moveTarget} onChange={event => setMoveTarget(event.target.value)} aria-label="게시글 이동 게시판">
+                    {BOARD_DEFINITIONS.map(item => <option key={item.id} value={item.id} disabled={item.id === 'photo'}>{item.label}</option>)}
+                  </select>}
+                  {isAdmin && <button type="button" disabled={moveTarget === 'photo'} onClick={() => movePost(post, moveTarget)}>이동</button>}
+                  {post.canManage && <div className="photo-feed-manage">
+                    <button type="button" className="outline-button" onClick={() => openEditor(post)}><Pencil size={14} /> 수정</button>
+                    <button type="button" className="danger-button" onClick={() => deletePost(post)}><Trash2 size={14} /> 삭제</button>
+                  </div>}
+                </div>
+                {feedCommentsPostId === post.postId && (
+                  <div className="photo-feed-comments">
+                    <BoardDetail
+                      inline board={board} detail={detail} loading={detailLoading}
+                      isAdmin={isAdmin} userId={auth.user.userId} previews={previews}
+                      comments={[...(detail?.comments || [])].sort((a, b) => commentSort === 'oldest' ? a.createdAt.localeCompare(b.createdAt) : b.createdAt.localeCompare(a.createdAt))}
+                      commentText={commentText} setCommentText={setCommentText} replyTo={replyTo}
+                      setReplyTo={setReplyTo} editingComment={editingComment} setEditingComment={setEditingComment}
+                      commentSort={commentSort} setCommentSort={setCommentSort}
+                      onBack={() => { setFeedCommentsPostId(''); setDetail(null); }}
+                      onEdit={() => {}} onDelete={() => {}} onMove={() => {}}
+                      moveTarget={moveTarget} onMoveTargetChange={setMoveTarget}
+                      onDownload={downloadFile} onDownloadAll={downloadAllFiles} onOpenImage={setLightboxIndex}
+                      onPreviewText={previewTextFile} onCommentSave={saveComment} onCommentDelete={removeComment}
+                      onLike={likeComment} onToggleLock={toggleCommentLock}
+                      onRefresh={async () => {
+                        const result = await api('boardComments', { token: auth.token, boardId: 'photo', postId: post.postId });
+                        setDetail(result.post);
+                      }} notify={notify}
+                    />
+                  </div>
+                )}
+              </div>
             </article>
           );
         })}
@@ -1596,6 +1877,7 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
 
       {view === 'detail' && (
         <BoardDetail
+          inline={false}
           board={board}
           detail={detail}
           loading={detailLoading}
@@ -1629,10 +1911,8 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
           onLike={likeComment}
           onToggleLock={toggleCommentLock}
           onRefresh={async () => {
-            const result = await api('boardPost', {
-              token: auth.token,
-              boardId,
-              postId: detail.postId,
+            const result = await api(boardId === 'photo' ? 'boardComments' : 'boardPost', {
+              token: auth.token, boardId, postId: detail.postId,
             });
             setDetail(result.post);
           }}
@@ -1663,6 +1943,7 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
           previewMode={previewMode}
           setPreviewMode={setPreviewMode}
           previews={previews}
+          onRefreshPreview={refreshImagePreview}
           onSetCover={fileId => {
             const clientId = String(fileId).startsWith('pending:')
               ? String(fileId).slice('pending:'.length)
@@ -1730,9 +2011,16 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
             <ChevronLeft />
           </button>
           <img
-            src={previews[galleryImages[lightboxIndex].fileId] || ''}
+            src={galleryImages[lightboxIndex].originalPreviewUrl || previews[galleryImages[lightboxIndex].fileId] || galleryImages[lightboxIndex].previewUrl || ''}
             alt={galleryImages[lightboxIndex].originalFilename}
             onClick={event => event.stopPropagation()}
+            onError={event => {
+              const image = event.currentTarget;
+              if (!image.dataset.refreshed) {
+                image.dataset.refreshed = 'true';
+                refreshImagePreview(galleryImages[lightboxIndex].fileId).catch(() => { image.dataset.failed = 'true'; });
+              } else image.dataset.failed = 'true';
+            }}
           />
           <button
             className="board-lightbox-next"
@@ -1791,6 +2079,7 @@ function BoardContentState({ type, children, onRetry, compact = false }) {
 }
 
 function BoardDetail({
+  inline = false,
   board,
   detail,
   loading,
@@ -1929,7 +2218,7 @@ function BoardDetail({
     );
   return (
     <div className="board-detail-view">
-      <div className="board-detail-top">
+      {!inline && <div className="board-detail-top">
         <button className="outline-button" onClick={onBack}>
           <ArrowLeft size={15} /> 목록으로
         </button>
@@ -1973,8 +2262,8 @@ function BoardDetail({
             </button>
           )}
         </div>
-      </div>
-      <article className="board-post-detail">
+      </div>}
+      {!inline && <article className="board-post-detail">
         <div className="board-post-title">
           <h2>{detail.title}</h2>
           <span className="board-markers">
@@ -2066,7 +2355,7 @@ function BoardDetail({
             ))}
           </section>
         )}
-      </article>
+      </article>}
       <section className="board-comments">
         <header>
           <div>
@@ -2105,9 +2394,9 @@ function BoardDetail({
           {!tree.length && <p className="board-empty">첫 댓글을 남겨 보세요.</p>}
         </div>
       </section>
-      <button className="board-detail-refresh" onClick={onRefresh}>
+      {!inline && <button className="board-detail-refresh" onClick={onRefresh}>
         <RefreshCw size={14} /> 새로고침
-      </button>
+      </button>}
     </div>
   );
 }
@@ -2134,6 +2423,7 @@ function BoardEditor({
   previewMode,
   setPreviewMode,
   previews,
+  onRefreshPreview,
   onSetCover,
   onReorder,
   inputRef,
@@ -2284,7 +2574,17 @@ function BoardEditor({
                 : 0;
               return (
                 <div key={item.key} className="board-upload-item">
-                  <img src={item.pending ? item.previewUrl : previews[fileId] || ''} alt="" />
+                  <img
+                    src={item.pending ? item.previewUrl : previews[fileId] || ''}
+                    alt=""
+                    onError={event => {
+                      const image = event.currentTarget;
+                      if (!item.pending && !image.dataset.refreshed) {
+                        image.dataset.refreshed = 'true';
+                        onRefreshPreview(fileId).catch(() => { image.dataset.failed = 'true'; });
+                      } else image.dataset.failed = 'true';
+                    }}
+                  />
                   <b>{name}</b>
                   <button
                     type="button"
@@ -2610,7 +2910,7 @@ function moveItem(items, from, to) {
   return copy;
 }
 
-function sendBoardChunk({ uploadId, token, start, chunk, onProgress }, xhrRef) {
+function sendBoardChunk({ uploadId, token, start, chunk, onProgress, taskId }, xhrRef) {
   return new Promise((resolve, reject) => {
     if (!API_URL) return reject(new Error('API 주소가 설정되지 않았습니다.'));
     const xhr = new XMLHttpRequest();
@@ -2622,6 +2922,7 @@ function sendBoardChunk({ uploadId, token, start, chunk, onProgress }, xhrRef) {
     xhr.setRequestHeader('X-Session-Token', token);
     xhr.setRequestHeader('X-Chunk-Start', String(start));
     xhr.setRequestHeader('X-Request-ID', requestId);
+    if (taskId) xhr.setRequestHeader('X-Task-ID', taskId);
     xhr.upload.onprogress = event => {
       if (event.lengthComputable) onProgress(event.loaded);
     };

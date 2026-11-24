@@ -502,10 +502,55 @@
 }
 .board-photo-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 14px;
+  grid-template-columns: minmax(0, 820px);
+  justify-content: center;
+  gap: 18px;
   padding: 4px 20px 18px;
 }
+.photo-feed-card {
+  min-width: 0;
+  overflow: hidden;
+  padding: 18px;
+  border: 1px solid #dfe6ef;
+  border-radius: 14px;
+  background: #fff;
+  box-shadow: 0 3px 12px #1e3a6e08;
+}
+.photo-feed-meta,
+.photo-feed-meta > div,
+.photo-feed-actions,
+.photo-feed-manage {
+  display: flex;
+  align-items: center;
+}
+.photo-feed-meta,
+.photo-feed-actions {
+  justify-content: space-between;
+  gap: 12px;
+}
+.photo-feed-meta > div { min-width: 0; gap: 10px; }
+.photo-feed-meta b { overflow: hidden; color: #344861; text-overflow: ellipsis; white-space: nowrap; }
+.photo-feed-meta time { color: #8793a4; font-size: 12px; white-space: nowrap; }
+.photo-feed-card h3 { margin: 14px 0 6px; color: #263a57; font-size: 18px; }
+.photo-feed-content { margin: 0 0 14px; color: #52627a; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
+.photo-feed-images { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 5px; }
+.photo-feed-image { position: relative; display: grid; min-width: 0; aspect-ratio: 1; place-items: center; overflow: hidden; padding: 0; border: 0; border-radius: 5px; background: #eef2f7; cursor: zoom-in; }
+.photo-feed-image img { width: 100%; height: 100%; object-fit: cover; }
+.photo-feed-image img[data-failed='true'] { visibility: hidden; }
+.photo-feed-image[data-failed='true']::after { content: '미리보기를 불러오지 못했습니다'; padding: 8px; color: #8793a4; font-size: 11px; text-align: center; }
+.photo-feed-images.count-1 { grid-template-columns: minmax(0, 1fr); }
+.photo-feed-images.count-1 .photo-feed-image { aspect-ratio: 16 / 10; max-height: 560px; }
+.photo-feed-images.count-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.photo-feed-images.count-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.photo-feed-no-image { display: flex; min-height: 100px; align-items: center; justify-content: center; gap: 8px; border-radius: 8px; background: #f2f5f9; color: #8793a4; }
+.photo-feed-count { padding-top: 8px; color: #8793a4; font-size: 12px; }
+.photo-feed-actions { justify-content: flex-start; flex-wrap: wrap; padding-top: 12px; border-top: 1px solid #edf0f4; }
+.photo-feed-actions > button { display: inline-flex; align-items: center; gap: 6px; padding: 6px 8px; border: 0; background: transparent; color: #52627a; cursor: pointer; }
+.photo-feed-manage { gap: 7px; margin-left: auto; }
+.photo-feed-comments { margin-top: 12px; border-top: 1px solid #edf0f4; }
+.photo-feed-comments .board-detail-view { padding: 12px 0 0; }
+.photo-feed-image-downloads { display: flex; flex-wrap: wrap; gap: 6px; padding-top: 7px; }
+.photo-feed-image-downloads button { display: inline-flex; align-items: center; gap: 4px; border: 0; background: transparent; color: #64748b; font-size: 11px; cursor: pointer; }
 .board-photo-card {
   display: flex;
   min-width: 0;
@@ -1361,7 +1406,7 @@
 }
 @media (max-width: 1100px) {
   .board-photo-grid {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: minmax(0, 820px);
   }
   .board-admin-tools {
     gap: 6px;
@@ -1402,8 +1447,8 @@
     min-width: 0;
   }
   .board-photo-grid {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 9px;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 14px;
     padding: 4px 14px 16px;
   }
   .board-photo-card-body {
@@ -1537,8 +1582,13 @@
     border-radius: 0;
   }
   .board-photo-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: minmax(0, 1fr);
+    padding-right: 12px;
+    padding-left: 12px;
   }
+  .photo-feed-card { padding: 13px; }
+  .photo-feed-images { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .photo-feed-images.count-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .board-advanced-search {
     display: grid;
     grid-template-columns: minmax(0, 1fr);

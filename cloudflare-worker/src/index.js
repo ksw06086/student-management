@@ -3,19 +3,20 @@
 export default {
   async fetch(request, env) {
     const requestId = safeRequestId(request.headers.get('X-Request-ID'));
+    const taskId = safeTaskId(request.headers.get('X-Task-ID'));
     const startedAt = performance.now();
     let status = 'error';
     try {
-      const response = await handleWorkerRequest(request, env, requestId);
+      const response = await handleWorkerRequest(request, env, requestId, taskId);
       status = response.status;
       return response;
     } finally {
-      logWorkerTiming(env, requestId, 'worker.request', startedAt, { status });
+      logWorkerTiming(env, requestId, 'worker.request', startedAt, { status, taskId });
     }
   },
 };
 
-async function handleWorkerRequest(request, env, requestId) {
+async function handleWorkerRequest(request, env, requestId, taskId) {
     const origin = request.headers.get('Origin') || '';
     const allowedOrigins = String(env.ALLOWED_ORIGINS || '')
       .split(',')
@@ -27,7 +28,7 @@ async function handleWorkerRequest(request, env, requestId) {
       if (origin && !allowed)
         return json({ ok: false, error: 'Origin is not allowed.' }, 403, origin);
       const [, , , ticket, fileId] = path.split('/');
-      return previewBoardImage(ticket, fileId, env, origin);
+      return previewBoardImage(ticket, fileId, new URL(request.url).searchParams.get('original') === '1', env, origin, requestId);
     }
     if (request.method === 'GET' && path.startsWith('/boards/download-zip/')) {
       if (origin && !allowed)
@@ -74,6 +75,9 @@ async function handleWorkerRequest(request, env, requestId) {
       return json({ ok: false, error: 'Invalid JSON request.' }, 400, origin);
     }
     payload.requestId = requestId;
+    const payloadTaskId = taskId || safeTaskId(payload.taskId);
+    if (payloadTaskId) payload.taskId = payloadTaskId;
+    else delete payload.taskId;
     if (payload.action === 'holidays') return getHolidays(payload, env, origin);
     if (payload.action === 'archiveUploadStart') return startArchiveUploads(payload, env, origin);
     if (payload.action === 'archiveDownload')
@@ -147,6 +151,11 @@ function logWorkerTiming(env, requestId, operation, startedAt, details = {}) {
 function safeRequestId(value) {
   const candidate = String(value || '');
   return /^[A-Za-z0-9._:-]{1,80}$/.test(candidate) ? candidate : crypto.randomUUID();
+}
+
+function safeTaskId(value) {
+  const candidate = String(value || '');
+  return /^[A-Za-z0-9._:-]{1,80}$/.test(candidate) ? candidate : '';
 }
 
 async function saveUploadState(env, key, state, requestId) {
@@ -256,6 +265,7 @@ async function callAppsScript(payload, env) {
     logWorkerTiming(env, payload.requestId || '', 'apps_script.request', startedAt, {
       action: String(payload.action || '').slice(0, 60),
       status,
+      taskId: safeTaskId(payload.taskId),
     });
     timingLogged = true;
     if (!upstream.ok || !data.ok)
@@ -266,6 +276,7 @@ async function callAppsScript(payload, env) {
       logWorkerTiming(env, payload.requestId || '', 'apps_script.request', startedAt, {
         action: String(payload.action || '').slice(0, 60),
         status,
+        taskId: safeTaskId(payload.taskId),
       });
     throw error;
   }
@@ -293,6 +304,7 @@ async function startArchiveUploads(payload, env, origin) {
       const state = {
         ...upload,
         token: String(payload.token || ''),
+        taskId: safeTaskId(payload.taskId),
         offset: 0,
         totalSize: Number(upload.fileSize),
       };
@@ -338,6 +350,7 @@ async function startBoardUploads(payload, env, origin) {
       const state = {
         ...upload,
         token: String(payload.token || ''),
+        taskId: safeTaskId(payload.taskId),
         offset: 0,
         totalSize: Number(upload.fileSize),
         scope: 'board',
@@ -376,6 +389,7 @@ async function uploadBoardChunk(request, env, origin) {
     );
   const uploadId = request.headers.get('X-Upload-Id') || '';
   const requestId = safeRequestId(request.headers.get('X-Request-ID'));
+  const taskId = safeTaskId(request.headers.get('X-Task-ID'));
   const token = request.headers.get('X-Session-Token') || '';
   const start = Number(request.headers.get('X-Chunk-Start'));
   const kvReadStartedAt = performance.now();
@@ -394,7 +408,8 @@ async function uploadBoardChunk(request, env, origin) {
   if (!Number.isSafeInteger(start) || !Number.isSafeInteger(state.totalSize))
     return json({ ok: false, error: '업로드 위치 정보가 올바르지 않습니다.' }, 400, origin);
   try {
-    const auth = await callAppsScript({ action: 'session', token, requestId }, env);
+    state.taskId = state.taskId || taskId;
+    const auth = await callAppsScript({ action: 'session', token, requestId, taskId }, env);
     if (auth.user?.userId !== state.uploadedBy)
       return json(
         { ok: false, error: '파일 업로드를 시작한 사용자만 이어서 진행할 수 있습니다.' },
@@ -510,6 +525,8 @@ async function finishBoardUpload(state, file, env, origin) {
         mimeType: state.mimeType,
         fileSize: state.fileSize,
         isCover: state.isCover === true,
+        thumbnailForFileId: state.thumbnailForFileId || '',
+        taskId: state.taskId,
       },
       env,
     );
@@ -574,6 +591,7 @@ async function uploadArchiveChunk(request, env, origin) {
     );
   const uploadId = request.headers.get('X-Upload-Id') || '';
   const requestId = safeRequestId(request.headers.get('X-Request-ID'));
+  const taskId = safeTaskId(request.headers.get('X-Task-ID'));
   const token = request.headers.get('X-Session-Token') || '';
   const start = Number(request.headers.get('X-Chunk-Start'));
   const kvReadStartedAt = performance.now();
@@ -592,7 +610,8 @@ async function uploadArchiveChunk(request, env, origin) {
   if (!Number.isSafeInteger(start) || !Number.isSafeInteger(state.totalSize))
     return json({ ok: false, error: '업로드 위치 정보가 올바르지 않습니다.' }, 400, origin);
   try {
-    const auth = await callAppsScript({ action: 'session', token, requestId }, env);
+    state.taskId = state.taskId || taskId;
+    const auth = await callAppsScript({ action: 'session', token, requestId, taskId }, env);
     if (auth.user?.role !== 'admin')
       return json({ ok: false, error: '관리자만 파일을 업로드할 수 있습니다.' }, 403, origin);
     const chunk = await request.arrayBuffer();
@@ -750,6 +769,7 @@ async function finishArchiveUpload(state, file, env, origin) {
         fileType: state.fileType,
         mimeType: state.mimeType,
         fileSize: state.fileSize,
+        taskId: state.taskId,
       },
       env,
     );
@@ -891,7 +911,11 @@ async function listBoardPosts(payload, env, origin, requestUrl) {
     const previewAccess = result.previewAccess;
     delete result.previewAccess;
     const fileIds = [
-      ...new Set((result.posts || []).map(post => post.coverFileId).filter(Boolean)),
+      ...new Set(
+        (result.posts || []).flatMap(post =>
+          (post.files || []).filter(file => file.fileType === 'image').map(file => file.fileId),
+        ),
+      ),
     ];
     if (!fileIds.length) return json(result, 200, origin);
     const preview = previewAccess || await callAppsScript(
@@ -906,12 +930,24 @@ async function listBoardPosts(payload, env, origin, requestUrl) {
       { expirationTtl: 300 },
     );
     const base = new URL(requestUrl).origin;
-    result.posts = result.posts.map(post => ({
-      ...post,
-      previewUrl: filesById[post.coverFileId]
+    const previewExpiresAt = Date.now() + 300000;
+    result.posts = result.posts.map(post => {
+      const files = (post.files || []).map(file => {
+        if (!filesById[file.fileId]) return file;
+        const previewUrl = `${base}/boards/preview/${ticket}/${encodeURIComponent(file.fileId)}`;
+        return {
+          ...file,
+          previewUrl,
+          originalPreviewUrl: `${previewUrl}?original=1`,
+          previewExpiresAt,
+        };
+      });
+      const cover = files.find(file => file.fileId === post.coverFileId);
+      const coverUrl = filesById[post.coverFileId]
         ? `${base}/boards/preview/${ticket}/${encodeURIComponent(post.coverFileId)}`
-        : '',
-    }));
+        : '';
+      return { ...post, files, previewUrl: cover?.previewUrl || coverUrl };
+    });
     return json(result, 200, origin);
   } catch (error) {
     console.error('Board post listing failed', error?.message || error);
@@ -944,7 +980,7 @@ async function createBoardImagePreviewTicket(payload, env, origin, requestUrl) {
         previews: Object.fromEntries(
           Object.keys(files).map(fileId => [
             fileId,
-            `${base}/boards/preview/${ticket}/${encodeURIComponent(fileId)}`,
+            `${base}/boards/preview/${ticket}/${encodeURIComponent(fileId)}${files[fileId].thumbnailDriveFileId ? '?thumb=1' : ''}`,
           ]),
         ),
       },
@@ -1147,8 +1183,10 @@ function zipEndRecord(count, centralSize, centralOffset) {
 }
 
 // 짧은 만료 티켓으로 허용된 이미지·일반 텍스트만 비공개 인라인 스트림으로 제공합니다.
-async function previewBoardImage(ticket, requestedFileId, env, origin) {
+async function previewBoardImage(ticket, requestedFileId, original, env, origin, requestId) {
+  const kvReadStartedAt = performance.now();
   const raw = await env.ARCHIVE_UPLOADS?.get(`board-preview:${ticket}`);
+  logWorkerTiming(env, requestId, 'kv.preview_ticket_read', kvReadStartedAt);
   if (!raw) return json({ ok: false, error: '사진 미리보기가 만료되었습니다.' }, 410, origin);
   const state = JSON.parse(raw);
   let fileId;
@@ -1158,14 +1196,20 @@ async function previewBoardImage(ticket, requestedFileId, env, origin) {
     return json({ ok: false, error: '미리보기 파일 주소가 올바르지 않습니다.' }, 400, origin);
   }
   const file = state.files?.[fileId];
-  const mimeType = String(file?.mimeType || '');
+  const useThumbnail = !!file?.thumbnailDriveFileId && !original;
+  const mimeType = String(useThumbnail ? file?.thumbnailMimeType || 'image/jpeg' : file?.mimeType || '');
   if (!file || (!mimeType.startsWith('image/') && mimeType !== 'text/plain'))
     return json({ ok: false, error: '미리보기를 지원하지 않는 파일입니다.' }, 404, origin);
   try {
+    const driveStartedAt = performance.now();
     const response = await fetch(
-      `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(file.driveFileId)}?alt=media`,
+      `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(useThumbnail ? file.thumbnailDriveFileId : file.driveFileId)}?alt=media`,
       { headers: { Authorization: `Bearer ${state.driveToken}` } },
     );
+    logWorkerTiming(env, requestId, 'drive.photo_preview', driveStartedAt, {
+      status: response.status,
+      thumbnail: useThumbnail,
+    });
     if (!response.ok) return json({ ok: false, error: '사진을 불러오지 못했습니다.' }, 502, origin);
     const headers = {
       ...securityHeaders(),
@@ -1241,6 +1285,14 @@ async function deleteBoardFile(payload, env, origin) {
     );
     if (!response.ok && response.status !== 404)
       throw new Error(`Google Drive file delete failed (${response.status}).`);
+    if (prepared.thumbnailDriveFileId) {
+      const thumbnailResponse = await fetch(
+        `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(prepared.thumbnailDriveFileId)}`,
+        { method: 'DELETE', headers: { Authorization: `Bearer ${prepared.driveToken}` } },
+      );
+      if (!thumbnailResponse.ok && thumbnailResponse.status !== 404)
+        throw new Error(`Google Drive thumbnail delete failed (${thumbnailResponse.status}).`);
+    }
     return json(
       await callAppsScript(
         { action: 'boardCompleteFileDelete', token: payload.token, fileId: payload.fileId },
@@ -1414,7 +1466,7 @@ function corsHeaders(origin) {
   return {
     'Access-Control-Allow-Origin': origin,
     'Access-Control-Allow-Headers':
-      'Content-Type, X-Request-ID, X-Upload-Id, X-Session-Token, X-Chunk-Start',
+      'Content-Type, X-Request-ID, X-Task-ID, X-Upload-Id, X-Session-Token, X-Chunk-Start',
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
     Vary: 'Origin',
   };

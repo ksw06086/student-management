@@ -380,11 +380,14 @@ function route_(request) {
   PERFORMANCE_CONTEXT_ = {
     action: String(request && request.action || '').slice(0, 60),
     requestId: safePerformanceRequestId_(request && request.requestId),
+    taskId: safePerformanceRequestId_(request && request.taskId),
     enabled: PropertiesService.getScriptProperties().getProperty('ENABLE_PERFORMANCE_LOGS') === 'true',
     spreadsheet: null,
+    schemaSheets: new Map(),
   };
   try {
     const result = routeInternal_(request);
+    if (result && result.ok) bumpBoardArchiveCacheVersion_(String(request && request.action || ''));
     recordPerformance_("apps_script.request", startedAt, { outcome: result && result.ok ? 'ok' : 'error' });
     return result;
   } finally {
@@ -395,6 +398,58 @@ function route_(request) {
 function safePerformanceRequestId_(value) {
   const requestId = String(value || '');
   return /^[A-Za-z0-9._:-]{1,80}$/.test(requestId) ? requestId : '';
+}
+
+function bumpBoardArchiveCacheVersion_(action) {
+  const boardActions = /^(saveBoard|publishBoard|deleteBoard|restoreBoard|bulkBoard|purgeBoard|toggleBoard|setBoard|reorderBoard|boardUpload|boardComplete|initializeBoards)/.test(action) || action === 'boardPost';
+  const archiveActions = /^(saveArchive|publishArchive|deleteArchive|archiveUpload|archiveComplete)/.test(action) || action === 'archivePostView';
+  if (!boardActions && !archiveActions) return;
+  const cache = CacheService.getScriptCache();
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    if (boardActions) cache.put('read-version:board', String((Number(cache.get('read-version:board')) || 0) + 1), 21600);
+    if (archiveActions) cache.put('read-version:archive', String((Number(cache.get('read-version:archive')) || 0) + 1), 21600);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function cachedBoardPosts_(session, request) {
+  const cache = CacheService.getScriptCache();
+  const version = cache.get('read-version:board') || '0';
+  const key = 'board-list:' + hash_(JSON.stringify([version, session.userId, session.role, cacheableRequest_(request)]));
+  const cached = cache.get(key);
+  if (cached) {
+    const result = JSON.parse(cached);
+    if (result.previewAccess && result.previewAccess.files.length)
+      result.previewAccess.driveToken = ScriptApp.getOAuthToken();
+    return result;
+  }
+  const result = listBoardPosts_(session, request);
+  const stored = JSON.parse(JSON.stringify(result));
+  if (stored.previewAccess) delete stored.previewAccess.driveToken;
+  try { cache.put(key, JSON.stringify(stored), 15); } catch (_) { /* CacheService item size is bounded; skip oversized results. */ }
+  return result;
+}
+
+function cachedArchivePosts_(session, request) {
+  const cache = CacheService.getScriptCache();
+  const version = cache.get('read-version:archive') || '0';
+  const key = 'archive-list:' + hash_(JSON.stringify([version, session.userId, session.role, cacheableRequest_(request)]));
+  const cached = cache.get(key);
+  if (cached) return JSON.parse(cached);
+  const result = Object.assign({ ok: true }, readArchivePosts_(request));
+  try { cache.put(key, JSON.stringify(result), 15); } catch (_) { /* CacheService item size is bounded; skip oversized results. */ }
+  return result;
+}
+
+function cacheableRequest_(request) {
+  const value = Object.assign({}, request || {});
+  delete value.token;
+  delete value.requestId;
+  delete value.taskId;
+  return value;
 }
 
 function routeInternal_(request) {
@@ -494,7 +549,7 @@ function routeInternal_(request) {
         return withSession_(request, ['admin'], () => ({ ok: true, logs: readLogs_() }));
       case 'boardPosts':
         return withSession_(request, ['admin', 'user'], session =>
-          listBoardPosts_(session, request),
+          cachedBoardPosts_(session, request),
         );
       case 'boardStatus':
         return withSession_(request, ['admin', 'user'], () => boardStatus_());
@@ -503,6 +558,10 @@ function routeInternal_(request) {
       case 'boardPost':
         return withSession_(request, ['admin', 'user'], session =>
           readBoardPost_(session, request.boardId, request.postId),
+        );
+      case 'boardComments':
+        return withSession_(request, ['admin', 'user'], session =>
+          readBoardCommentsForPost_(session, request.boardId, request.postId),
         );
       case 'saveBoardPost':
         return withSession_(request, ['admin', 'user'], session =>
@@ -605,10 +664,7 @@ function routeInternal_(request) {
           ),
         );
       case 'archivePosts':
-        return withSession_(request, ['admin', 'user'], () => ({
-          ok: true,
-          posts: readArchivePosts_(),
-        }));
+        return withSession_(request, ['admin', 'user'], session => cachedArchivePosts_(session, request));
       case 'saveArchivePost':
         return withSession_(request, ['admin'], session =>
           saveArchivePost_(session, request.post || {}),
@@ -784,6 +840,7 @@ function recordPerformance_(operation, startedAt, details) {
   Logger.log(JSON.stringify(Object.assign({
     type: 'performance',
     requestId: context.requestId,
+    taskId: context.taskId,
     action: context.action,
     operation: operation,
     durationMs: Math.max(0, Date.now() - startedAt),
@@ -2034,7 +2091,8 @@ function appendLog_(session, action, year, studentId, studentName, detail) {
   ]);
 }
 // 자료실 게시글과 파일 시트의 전체 행을 각각 읽어 파일 메타데이터를 게시글 ID별로 묶어 반환합니다.
-function readArchivePosts_() {
+function readArchivePosts_(request) {
+  request = request || {};
   const postSheet = getOrCreateSheet_(ARCHIVE_POSTS_SHEET, ARCHIVE_POST_HEADERS);
   const fileSheet = getOrCreateSheet_(ARCHIVE_FILES_SHEET, ARCHIVE_FILE_HEADERS);
   const fileRows = fileSheet.getDataRange().getValues().slice(1);
@@ -2052,7 +2110,7 @@ function readArchivePosts_() {
         fileSize: Number(row[7]) || 0,
       });
     });
-  return postSheet
+  const posts = postSheet
     .getDataRange()
     .getValues()
     .slice(1)
@@ -2067,8 +2125,27 @@ function readArchivePosts_() {
       updatedAt: archiveDate_(row[6]),
       viewCount: Number(row[7]) || 0,
       files: filesByPost[String(row[0])] || [],
-    }))
-    .reverse();
+    }));
+  const query = String(request.query || '').trim().toLocaleLowerCase('ko-KR');
+  const type = String(request.typeFilter || 'all');
+  const filtered = posts.filter(post => {
+    const matchesType = type === 'all' || post.files.some(file => file.fileType === type);
+    const matchesQuery = !query || [post.title, post.content, post.authorName,
+      ...post.files.map(file => file.originalFilename)].some(value =>
+      String(value || '').toLocaleLowerCase('ko-KR').includes(query));
+    return matchesType && matchesQuery;
+  });
+  const sort = String(request.sort || 'newest');
+  filtered.sort((a, b) => sort === 'oldest'
+    ? String(a.createdAt).localeCompare(String(b.createdAt))
+    : sort === 'title'
+      ? String(a.title).localeCompare(String(b.title), 'ko')
+      : String(b.createdAt).localeCompare(String(a.createdAt)));
+  const page = Math.max(1, Number(request.page) || 1);
+  const pageSize = Math.min(50, Math.max(1, Number(request.pageSize) || 10));
+  const paginated = request.page != null || request.pageSize != null || request.query || request.typeFilter || request.sort;
+  const selected = paginated ? filtered.slice((page - 1) * pageSize, page * pageSize) : filtered;
+  return { posts: selected, total: filtered.length, page, pageSize };
 }
 // 자료실 게시글 전체에서 활성 게시글 ID를 검색해 제목·내용·수정일을 갱신하거나 새 게시글 행을 추가합니다.
 function saveArchivePost_(session, input) {
@@ -2464,6 +2541,16 @@ function boardSheets_() {
   };
 }
 
+// 피드 댓글 펼치기 API는 게시글 상태와 댓글·좋아요만 확인하므로 알림·파일·활동 로그 시트는 열지 않습니다.
+function boardCommentSheets_() {
+  const posts = schemaSheet_(BOARD_POSTS_SHEET, BOARD_POST_HEADERS, false);
+  const comments = schemaSheet_(BOARD_COMMENTS_SHEET, BOARD_COMMENT_HEADERS, false);
+  const likes = schemaSheet_(BOARD_LIKES_SHEET, BOARD_LIKE_HEADERS, false);
+  if (!posts || !comments || !likes)
+    throw new Error('BOARD_SHEETS_NOT_INITIALIZED: 댓글을 조회할 게시판 시트가 준비되지 않았습니다.');
+  return { posts, comments, likes };
+}
+
 function boardStatus_() {
   const definitions = [
     [BOARD_POSTS_SHEET, BOARD_POST_HEADERS],
@@ -2580,23 +2667,20 @@ function boardPostFromRow_(row, files, comments) {
 function listBoardPosts_(session, request) {
   const boardId = validBoardId_(request.boardId);
   const sheets = boardSheets_();
-  const filesByPost = {};
-  const activeFileRows = boardRows_(sheets.files).filter(
+  const fileRowsByPost = new Map();
+  const allFileRows = boardRows_(sheets.files);
+  const activeFileRows = allFileRows.filter(
     row => String(row[1]) === boardId && String(row[12]) === 'active',
+  );
+  const thumbnailDriveBySource = new Map(
+    allFileRows
+      .filter(row => String(row[12]) === 'thumbnail' && String(row[5]).startsWith('thumbnail-of:'))
+      .map(row => [String(row[5]).slice('thumbnail-of:'.length), String(row[3])]),
   );
   activeFileRows.forEach(row => {
       const key = String(row[2]);
-      if (!filesByPost[key]) filesByPost[key] = [];
-      filesByPost[key].push({
-        fileId: String(row[0]),
-        boardId: String(row[1]),
-        postId: key,
-        originalFilename: String(row[4]),
-        fileType: String(row[6]),
-        mimeType: String(row[7]),
-        fileSize: Number(row[8]) || 0,
-        sortOrder: Number(row[13]) || 0,
-      });
+      if (!fileRowsByPost.has(key)) fileRowsByPost.set(key, []);
+      fileRowsByPost.get(key).push(row);
     });
   const commentCounts = {};
   boardRows_(sheets.comments)
@@ -2646,8 +2730,8 @@ function listBoardPosts_(session, request) {
       if (updatedFrom && updated < updatedFrom) return false;
       if (updatedTo && updated > updatedTo) return false;
       if (!query) return true;
-      const fileText = (filesByPost[String(row[0])] || [])
-        .map(file => file.originalFilename)
+      const fileText = (fileRowsByPost.get(String(row[0])) || [])
+        .map(file => file[4])
         .join(' ');
       const searchFields =
         searchField === 'title'
@@ -2662,22 +2746,28 @@ function listBoardPosts_(session, request) {
           .toLocaleLowerCase('ko-KR')
           .includes(query),
       );
-    })
-    .map(row =>
-      boardPostFromRow_(row, filesByPost[String(row[0])] || [], commentCounts[String(row[0])] || 0),
-    );
+    });
   const sort = String(request.sort || 'newest');
   rows.sort((a, b) => {
-    if (!includeDeleted && !includeDrafts && a.isNotice !== b.isNotice) return a.isNotice ? -1 : 1;
-    if (!includeDeleted && !includeDrafts && a.isPinned !== b.isPinned) return a.isPinned ? -1 : 1;
-    if (sort === 'oldest') return a.createdAt.localeCompare(b.createdAt);
+    if (!includeDeleted && !includeDrafts && a[10] !== b[10]) return a[10] ? -1 : 1;
+    if (!includeDeleted && !includeDrafts && a[11] !== b[11]) return a[11] ? -1 : 1;
+    if (sort === 'oldest') return archiveDate_(a[6]).localeCompare(archiveDate_(b[6]));
     if (sort === 'views')
-      return b.viewCount - a.viewCount || b.createdAt.localeCompare(a.createdAt);
-    return b.createdAt.localeCompare(a.createdAt);
+      return (Number(b[8]) || 0) - (Number(a[8]) || 0) || archiveDate_(b[6]).localeCompare(archiveDate_(a[6]));
+    return archiveDate_(b[6]).localeCompare(archiveDate_(a[6]));
   });
   const page = Math.max(1, Number(request.page) || 1);
   const pageSize = Math.min(50, Math.max(1, Number(request.pageSize) || 10));
-  const pageRows = rows.slice((page - 1) * pageSize, page * pageSize);
+  const pageRows = rows.slice((page - 1) * pageSize, page * pageSize).map(row => {
+    const files = (fileRowsByPost.get(String(row[0])) || []).map(file => ({
+      fileId: String(file[0]), boardId: String(file[1]), postId: String(file[2]),
+      originalFilename: String(file[4]), fileType: String(file[6]), mimeType: String(file[7]),
+      fileSize: Number(file[8]) || 0, sortOrder: Number(file[13]) || 0,
+    }));
+    const post = boardPostFromRow_(row, files, commentCounts[String(row[0])] || 0);
+    post.canManage = session.role === 'admin' || session.userId === post.authorId;
+    return post;
+  });
   const result = {
     ok: true,
     boardId: boardId,
@@ -2688,19 +2778,21 @@ function listBoardPosts_(session, request) {
   };
   if (boardId === 'photo' && request.includePreviewAccess === true) {
     const previewPosts = pageRows.filter(post => post.status === 'active');
-    const coverFileIds = new Set(
-      previewPosts.map(post => String(post.coverFileId || '')).filter(Boolean),
+    const pagePostIds = new Set(previewPosts.map(post => post.postId));
+    const previewFileIds = new Set(
+      previewPosts.flatMap(post => post.files.map(file => String(file.fileId))),
     );
     const previewFiles = activeFileRows
       .filter(
         row =>
-          coverFileIds.has(String(row[0])) &&
-          previewPosts.some(post => post.postId === String(row[2])) &&
+          previewFileIds.has(String(row[0])) &&
+          pagePostIds.has(String(row[2])) &&
           String(row[7] || '').startsWith('image/'),
       )
       .map(row => ({
         fileId: String(row[0]),
         driveFileId: String(row[3]),
+        thumbnailDriveFileId: thumbnailDriveBySource.get(String(row[0])) || '',
         filename: String(row[4]),
         mimeType: String(row[7]),
       }));
@@ -2726,36 +2818,52 @@ function readBoardPost_(session, requestedBoardId, requestedPostId) {
   if (index < 0) throw new Error('게시글을 찾을 수 없습니다.');
   const lock = LockService.getScriptLock();
   lock.waitLock(10000);
+  let viewCount;
   try {
     const rowNumber = index + 2;
-    const viewCount = (Number(rows[index][8]) || 0) + 1;
+    viewCount = (Number(sheets.posts.getRange(rowNumber, 9).getValues()[0][0]) || 0) + 1;
     sheets.posts.getRange(rowNumber, 9).setValue(viewCount);
-    const files = boardRows_(sheets.files)
-      .filter(row => String(row[2]) === postId && String(row[12]) === 'active')
-      .map(row => ({
-        fileId: String(row[0]),
-        boardId: String(row[1]),
-        postId: postId,
-        originalFilename: String(row[4]),
-        fileType: String(row[6]),
-        mimeType: String(row[7]),
-        fileSize: Number(row[8]) || 0,
-        sortOrder: Number(row[13]) || 0,
-      }));
-    const comments = readBoardComments_(postId, sheets, session.userId);
-    const post = boardPostFromRow_(
-      rows[index],
-      files,
-      comments.filter(item => item.status === 'active').length,
-    );
-    post.viewCount = viewCount;
-    post.canManage = session.role === 'admin' || session.userId === post.authorId;
-    post.comments = comments;
-    boardLog_(session, '게시글 조회', boardId, postId, '', '게시글 상세 조회');
-    return { ok: true, post: post };
   } finally {
     lock.releaseLock();
   }
+  const files = boardRows_(sheets.files)
+    .filter(row => String(row[2]) === postId && String(row[12]) === 'active')
+    .map(row => ({
+      fileId: String(row[0]), boardId: String(row[1]), postId: postId,
+      originalFilename: String(row[4]), fileType: String(row[6]), mimeType: String(row[7]),
+      fileSize: Number(row[8]) || 0, sortOrder: Number(row[13]) || 0,
+    }));
+  const comments = readBoardComments_(postId, sheets, session.userId);
+  const post = boardPostFromRow_(rows[index], files, comments.filter(item => item.status === 'active').length);
+  post.viewCount = viewCount;
+  post.canManage = session.role === 'admin' || session.userId === post.authorId;
+  post.comments = comments;
+  boardLog_(session, '게시글 조회', boardId, postId, '', '게시글 상세 조회');
+  return { ok: true, post: post };
+}
+
+// 사진 피드에서 댓글을 펼칠 때 댓글·좋아요만 반환하며 조회수와 활동 로그를 변경하지 않습니다.
+function readBoardCommentsForPost_(session, requestedBoardId, requestedPostId) {
+  const boardId = validBoardId_(requestedBoardId);
+  const postId = String(requestedPostId || '').trim();
+  const sheets = boardCommentSheets_();
+  const post = boardRows_(sheets.posts).find(
+    row => String(row[0]) === postId && String(row[1]) === boardId && String(row[9]) === 'active',
+  );
+  if (!post) throw new Error('게시글을 찾을 수 없습니다.');
+  const comments = readBoardComments_(postId, sheets, session.userId);
+  return {
+    ok: true,
+    post: {
+      postId,
+      commentCount: comments.filter(item => item.status === 'active').length,
+      commentsLocked: post[13] === true || post[13] === 'TRUE',
+      comments: comments.map(comment => ({
+        ...comment,
+        canManage: session.role === 'admin' || session.userId === comment.authorId,
+      })),
+    },
+  };
 }
 
 function saveBoardPost_(session, input) {
@@ -2795,10 +2903,12 @@ function saveBoardPost_(session, input) {
     }
     sheets.posts.getRange(index + 2, 1, 1, BOARD_POST_HEADERS.length).setValues([updated]);
     boardLog_(session, '게시글 수정', boardId, postId, '', title);
-    return { ok: true, postId: postId };
+    return { ok: true, postId: postId, updatedAt: timestamp, status: String(updated[9]) };
   }
   const newId = Utilities.getUuid();
   const status = input.publish === false ? 'draft' : 'active';
+  if (boardId === 'photo' && status === 'active')
+    throw new Error('사진 게시글은 사진 업로드를 마친 뒤 공개해야 합니다.');
   sheets.posts.appendRow([
     newId,
     boardId,
@@ -2825,7 +2935,38 @@ function saveBoardPost_(session, input) {
     '',
     title,
   );
-  return { ok: true, postId: newId };
+  if (status === 'active') notifyBoardPublication_(session, sheets, [newId, boardId, title]);
+  return {
+    ok: true,
+    postId: newId,
+    status: status,
+    post: {
+      postId: newId, boardId: boardId, title: title, content: content,
+      authorId: session.userId, authorName: session.name, createdAt: timestamp,
+      updatedAt: timestamp, viewCount: 0, status: status,
+      isNotice: session.role === 'admin' && !!input.isNotice,
+      isPinned: session.role === 'admin' && !!input.isPinned,
+      isImportant: session.role === 'admin' && !!input.isImportant,
+      commentsLocked: false, coverFileId: '', files: [], commentCount: 0,
+    },
+  };
+}
+
+function notifyBoardPublication_(session, sheets, postRow) {
+  const recipients = readUsers_(false).filter(user => user.active && user.userId !== session.userId);
+  if (!recipients.length) return;
+  const createdAt = nowSeoul_();
+  const rows = recipients.map(user => [
+    Utilities.getUuid(), user.userId, postRow[1], postRow[0], 'new_post', String(postRow[2]), createdAt, '',
+  ]);
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const startRow = sheets.notifications.getLastRow() + 1;
+    sheets.notifications.getRange(startRow, 1, rows.length, BOARD_NOTIFICATION_HEADERS.length).setValues(rows);
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function publishBoardPost_(session, requestedId) {
@@ -2849,20 +2990,7 @@ function publishBoardPost_(session, requestedId) {
     throw new Error('사진 게시글은 사진을 한 장 이상 첨부해야 등록할 수 있습니다.');
   sheets.posts.getRange(index + 2, 10).setValue('active');
   sheets.posts.getRange(index + 2, 8).setValue(nowSeoul_());
-  readUsers_(false)
-    .filter(user => user.active && user.userId !== session.userId)
-    .forEach(user =>
-      sheets.notifications.appendRow([
-        Utilities.getUuid(),
-        user.userId,
-        row[1],
-        id,
-        'new_post',
-        String(row[2]),
-        nowSeoul_(),
-        '',
-      ]),
-    );
+  notifyBoardPublication_(session, sheets, row);
   boardLog_(session, '게시글 공개', row[1], id, '', String(row[2]));
   return { ok: true, postId: id };
 }
@@ -2960,7 +3088,12 @@ function readBoardComments_(postId, sheets, userId) {
   const comments = boardRows_(sheets.comments).filter(
     row => String(row[2]) === postId && ['active', 'deleted'].includes(String(row[9])),
   );
-  const likes = boardRows_(sheets.likes);
+  const likesByComment = new Map();
+  boardRows_(sheets.likes).forEach(like => {
+    const key = String(like[1]);
+    if (!likesByComment.has(key)) likesByComment.set(key, []);
+    likesByComment.get(key).push(like);
+  });
   return comments.map(row => ({
     commentId: String(row[0]),
     boardId: String(row[1]),
@@ -2972,10 +3105,8 @@ function readBoardComments_(postId, sheets, userId) {
     createdAt: archiveDate_(row[7]),
     updatedAt: archiveDate_(row[8]),
     status: String(row[9]),
-    likeCount: likes.filter(like => String(like[1]) === String(row[0])).length,
-    likedByMe: likes.some(
-      like => String(like[1]) === String(row[0]) && String(like[2]) === String(userId),
-    ),
+    likeCount: (likesByComment.get(String(row[0])) || []).length,
+    likedByMe: (likesByComment.get(String(row[0])) || []).some(like => String(like[2]) === String(userId)),
   }));
 }
 
@@ -2993,16 +3124,16 @@ function saveBoardComment_(session, input) {
   if (postIndex < 0) throw new Error('게시글을 찾을 수 없습니다.');
   const post = posts[postIndex];
   if (String(post[13]) === 'TRUE' || post[13] === true) throw new Error('댓글이 잠겨 있습니다.');
+  const commentId = String(input.commentId || '').trim();
+  const rows = boardRows_(sheets.comments);
   if (
     parentId &&
-    !boardRows_(sheets.comments).some(
+    !rows.some(
       row =>
         String(row[0]) === parentId && String(row[2]) === postId && String(row[9]) === 'active',
     )
   )
     throw new Error('답글 대상 댓글을 찾을 수 없습니다.');
-  const commentId = String(input.commentId || '').trim();
-  const rows = boardRows_(sheets.comments);
   const index = commentId
     ? rows.findIndex(row => String(row[0]) === commentId && String(row[9]) === 'active')
     : -1;
@@ -3015,7 +3146,10 @@ function saveBoardComment_(session, input) {
     sheets.comments.getRange(index + 2, 7).setValue(content);
     sheets.comments.getRange(index + 2, 9).setValue(now);
     boardLog_(session, '댓글 수정', post[1], postId, commentId, '댓글 수정');
-    return { ok: true, commentId: commentId };
+    const updated = [...row];
+    updated[6] = content;
+    updated[8] = now;
+    return { ok: true, commentId: commentId, comment: boardCommentResult_(updated, sheets, session.userId), commentCount: rows.filter(item => String(item[2]) === postId && String(item[9]) === 'active').length };
   }
   const newId = Utilities.getUuid();
   sheets.comments.appendRow([
@@ -3050,7 +3184,19 @@ function saveBoardComment_(session, input) {
     newId,
     content.slice(0, 100),
   );
-  return { ok: true, commentId: newId };
+  const savedRow = [newId, post[1], postId, parentId, session.userId, session.name, content, now, now, 'active', 0];
+  return { ok: true, commentId: newId, comment: boardCommentResult_(savedRow, sheets, session.userId), commentCount: rows.filter(item => String(item[2]) === postId && String(item[9]) === 'active').length + 1 };
+}
+
+function boardCommentResult_(row, sheets, userId) {
+  const likes = boardRows_(sheets.likes).filter(like => String(like[1]) === String(row[0]));
+  return {
+    commentId: String(row[0]), boardId: String(row[1]), postId: String(row[2]),
+    parentId: String(row[3] || ''), authorId: String(row[4]), authorName: String(row[5]),
+    content: String(row[6]), createdAt: archiveDate_(row[7]), updatedAt: archiveDate_(row[8]),
+    status: String(row[9]), likeCount: likes.length,
+    likedByMe: likes.some(like => String(like[2]) === String(userId)),
+  };
 }
 
 function deleteBoardComment_(session, requestedId) {
@@ -3063,12 +3209,14 @@ function deleteBoardComment_(session, requestedId) {
   if (session.role !== 'admin' && String(row[4]) !== session.userId)
     throw new Error('본인 댓글만 삭제할 수 있습니다.');
   const hasReplies = rows.some(item => String(item[3]) === id && String(item[9]) === 'active');
+  let content = String(row[6]);
   if (hasReplies) {
-    sheets.comments.getRange(index + 2, 7).setValue('삭제된 댓글입니다.');
+    content = '삭제된 댓글입니다.';
+    sheets.comments.getRange(index + 2, 7).setValue(content);
     sheets.comments.getRange(index + 2, 10).setValue('deleted');
   } else sheets.comments.getRange(index + 2, 10).setValue('deleted');
   boardLog_(session, '댓글 삭제', row[1], row[2], id, '댓글 삭제');
-  return { ok: true };
+  return { ok: true, commentId: id, postId: String(row[2]), status: 'deleted', content: content, hasReplies: hasReplies, commentCount: rows.filter(item => String(item[2]) === String(row[2]) && String(item[9]) === 'active' && String(item[0]) !== id).length };
 }
 
 function toggleBoardCommentLike_(session, requestedId) {
@@ -3279,6 +3427,7 @@ function boardUploadStart_(session, request) {
   const post = postRows[postIndex];
   if (session.role !== 'admin' && String(post[4]) !== session.userId)
     throw new Error('본인 게시글에만 파일을 첨부할 수 있습니다.');
+  const fileRows = boardRows_(sheets.files);
   let total = 0;
   const files = inputFiles.map(file => {
     const originalFilename = String(file.name || '');
@@ -3291,6 +3440,14 @@ function boardUploadStart_(session, request) {
       throw new Error('허용되지 않는 파일이거나 파일 정보가 올바르지 않습니다.');
     if (boardId === 'photo' && rule[1] !== 'image')
       throw new Error('사진 게시판에는 이미지 파일만 첨부할 수 있습니다.');
+    const thumbnailForFileId = String(file.thumbnailForFileId || '').trim();
+    if (thumbnailForFileId) {
+      const source = fileRows.find(
+        row => String(row[0]) === thumbnailForFileId && String(row[2]) === postId && String(row[12]) === 'active',
+      );
+      if (boardId !== 'photo' || !source || !String(source[7] || '').startsWith('image/'))
+        throw new Error('썸네일을 연결할 원본 사진을 확인할 수 없습니다.');
+    }
     if (mimeType !== 'application/octet-stream' && mimeType !== rule[0])
       throw new Error(filename + ' 파일의 MIME 형식이 확장자와 일치하지 않습니다.');
     total += size;
@@ -3306,6 +3463,7 @@ function boardUploadStart_(session, request) {
       fileType: rule[1],
       size: size,
       isCover: file.isCover === true,
+      thumbnailForFileId: thumbnailForFileId,
     };
   });
   const folderId = boardDriveFolder_();
@@ -3316,8 +3474,13 @@ function boardUploadStart_(session, request) {
       name: storedFilename,
       mimeType: file.mimeType,
       parents: [folderId],
-      appProperties: { boardPostId: postId, boardFileId: file.fileId, boardId: boardId },
-      description: '게시판 첨부 파일',
+      appProperties: {
+        boardPostId: postId,
+        boardFileId: file.fileId,
+        boardId: boardId,
+        ...(file.thumbnailForFileId ? { boardThumbnailFor: file.thumbnailForFileId } : {}),
+      },
+      description: file.thumbnailForFileId ? '게시판 사진 피드 썸네일' : '게시판 첨부 파일',
     };
     const response = fetchDriveRequest_(
       'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,mimeType,size,parents',
@@ -3355,6 +3518,7 @@ function boardUploadStart_(session, request) {
       driveFolderId: folderId,
       uploadedBy: session.userId,
       isCover: file.isCover,
+      thumbnailForFileId: file.thumbnailForFileId,
     };
   });
   return { ok: true, uploads: uploads };
@@ -3375,6 +3539,7 @@ function boardUploadComplete_(session, request) {
   );
   if (!post || (session.role !== 'admin' && String(post[4]) !== session.userId))
     throw new Error('파일을 연결할 게시글 권한이 없습니다.');
+  const thumbnailForFileId = String(request.thumbnailForFileId || '').trim();
   const token = ScriptApp.getOAuthToken();
   const verify = fetchDriveRequest_(
     'https://www.googleapis.com/drive/v3/files/' +
@@ -3390,12 +3555,20 @@ function boardUploadComplete_(session, request) {
     actual.appProperties?.boardPostId !== postId ||
     actual.appProperties?.boardFileId !== fileId ||
     actual.appProperties?.boardId !== boardId ||
+    String(actual.appProperties?.boardThumbnailFor || '') !== thumbnailForFileId ||
     actual.name !== request.storedFilename ||
     !actual.parents?.includes(String(request.driveFolderId || ''))
   )
     throw new Error('Google Drive 파일 검증에 실패했습니다.');
   const sheet = boardSheets_().files;
   const oldRows = boardRows_(sheet);
+  const sourceIndex = thumbnailForFileId
+    ? oldRows.findIndex(
+        row => String(row[0]) === thumbnailForFileId && String(row[2]) === postId && String(row[12]) === 'active',
+      )
+    : -1;
+  if (thumbnailForFileId && (boardId !== 'photo' || sourceIndex < 0))
+    throw new Error('썸네일 원본 사진 연결을 검증하지 못했습니다.');
   const existing = oldRows.findIndex(row => String(row[0]) === fileId);
   const sortOrder = oldRows.filter(
     row => String(row[2]) === postId && String(row[12]) === 'active',
@@ -3405,35 +3578,30 @@ function boardUploadComplete_(session, request) {
     boardId,
     postId,
     driveFileId,
-    request.originalFilename,
-    request.storedFilename,
-    request.fileType,
+    thumbnailForFileId ? '(피드 썸네일)' : request.originalFilename,
+    thumbnailForFileId ? 'thumbnail-of:' + thumbnailForFileId : request.storedFilename,
+    thumbnailForFileId ? 'thumbnail' : request.fileType,
     request.mimeType,
     Number(actual.size) || Number(request.fileSize) || 0,
     request.driveFolderId,
     session.userId,
     nowSeoul_(),
-    'active',
+    thumbnailForFileId ? 'thumbnail' : 'active',
     sortOrder,
   ];
   if (existing >= 0) sheet.getRange(existing + 2, 1, 1, data.length).setValues([data]);
   else sheet.appendRow(data);
-  if (
+  if (!thumbnailForFileId && (
     request.isCover === true ||
     !boardRows_(boardSheets_().posts)[rows.findIndex(row => String(row[0]) === postId)][14]
-  ) {
+  )) {
     const posts = boardSheets_().posts;
     const postIndex = rows.findIndex(row => String(row[0]) === postId);
     posts.getRange(postIndex + 2, 15).setValue(fileId);
   }
-  boardLog_(
-    session,
-    '파일 업로드',
-    boardId,
-    postId,
-    fileId,
-    String(request.originalFilename || ''),
-  );
+  if (!thumbnailForFileId) {
+    boardLog_(session, '파일 업로드', boardId, postId, fileId, String(request.originalFilename || ''));
+  }
   return {
     ok: true,
     fileId: fileId,
@@ -3466,7 +3634,7 @@ function boardDownloadInfo_(session, requestedFileId) {
 
 function boardPreviewInfo_(session, requestedFileIds) {
   const ids = Array.isArray(requestedFileIds)
-    ? [...new Set(requestedFileIds.map(String))].slice(0, 20)
+    ? [...new Set(requestedFileIds.map(String))].slice(0, 200)
     : [];
   const sheets = boardSheets_();
   const files = boardRows_(sheets.files).filter(row => {
@@ -3474,7 +3642,13 @@ function boardPreviewInfo_(session, requestedFileIds) {
     const mimeType = String(row[7] || '');
     return mimeType.startsWith('image/') || mimeType === 'text/plain';
   });
+  const allFileRows = boardRows_(sheets.files);
   const posts = boardRows_(sheets.posts);
+  const thumbnailBySource = new Map(
+    allFileRows
+      .filter(row => String(row[12]) === 'thumbnail' && String(row[5]).startsWith('thumbnail-of:'))
+      .map(row => [String(row[5]).slice('thumbnail-of:'.length), String(row[3])]),
+  );
   const authorized = files.filter(file =>
     posts.some(
       post =>
@@ -3489,6 +3663,7 @@ function boardPreviewInfo_(session, requestedFileIds) {
     files: authorized.map(row => ({
       fileId: String(row[0]),
       driveFileId: String(row[3]),
+      thumbnailDriveFileId: thumbnailBySource.get(String(row[0])) || '',
       filename: String(row[4]),
       mimeType: String(row[7]),
     })),
@@ -3535,6 +3710,12 @@ function prepareBoardFileDelete_(session, requestedFileId) {
   );
   if (index < 0) throw new Error('삭제할 파일을 찾을 수 없습니다.');
   const file = rows[index];
+  const thumbnail = rows.find(
+    row =>
+      String(row[2]) === String(file[2]) &&
+      String(row[12]) === 'thumbnail' &&
+      String(row[5]) === 'thumbnail-of:' + fileId,
+  );
   const post = boardRows_(sheets.posts).find(
     row => String(row[0]) === String(file[2]) && String(row[9]) === 'active',
   );
@@ -3545,6 +3726,8 @@ function prepareBoardFileDelete_(session, requestedFileId) {
     ok: true,
     fileId: fileId,
     driveFileId: String(file[3]),
+    thumbnailFileId: thumbnail ? String(thumbnail[0]) : '',
+    thumbnailDriveFileId: thumbnail ? String(thumbnail[3]) : '',
     driveToken: ScriptApp.getOAuthToken(),
   };
 }
@@ -3558,6 +3741,13 @@ function completeBoardFileDelete_(session, requestedFileId) {
   );
   if (index < 0) throw new Error('삭제 상태의 파일을 찾을 수 없습니다.');
   sheet.getRange(index + 2, 13).setValue('deleted');
+  const thumbnailIndex = rows.findIndex(
+    row =>
+      String(row[2]) === String(rows[index][2]) &&
+      String(row[12]) === 'thumbnail' &&
+      String(row[5]) === 'thumbnail-of:' + fileId,
+  );
+  if (thumbnailIndex >= 0) sheet.getRange(thumbnailIndex + 2, 13).setValue('deleted');
   boardLog_(session, '첨부파일 삭제', rows[index][1], rows[index][2], fileId, rows[index][4]);
   return { ok: true };
 }
@@ -3571,7 +3761,7 @@ function prepareBoardPurge_(requestedId) {
   if (!post) throw new Error('영구 삭제할 게시글을 찾을 수 없습니다.');
   const files = boardRows_(sheets.files)
     .filter(
-      row => String(row[2]) === postId && ['active', 'delete_failed'].includes(String(row[12])),
+      row => String(row[2]) === postId && ['active', 'thumbnail', 'delete_failed'].includes(String(row[12])),
     )
     .map(row => ({ fileId: String(row[0]), driveFileId: String(row[3]) }));
   return { ok: true, postId: postId, files: files, driveToken: ScriptApp.getOAuthToken() };
@@ -3670,6 +3860,9 @@ function schemaSheet_(
   // 시트명 별칭과 헤더를 검증한 뒤 한글/영문 실제 컬럼을 내부 스키마 순서로 매핑하는 어댑터를 만듭니다.
   // getDataRange는 물리 시트 전체를 읽으며, 컬럼이 비연속이면 범위 어댑터에서 셀 단위 호출이 발생할 수 있습니다.
   const schema = schemaFor_(name, headers);
+  const requestCacheKey = [name, JSON.stringify(headers), !!createIfMissing, !!allowOptionalMissing, !!allowEmpty, !!initializeEmpty].join(':');
+  const requestCache = PERFORMANCE_CONTEXT_ && PERFORMANCE_CONTEXT_.schemaSheets;
+  if (requestCache && requestCache.has(requestCacheKey)) return requestCache.get(requestCacheKey);
   if (!schema) throw new Error('등록되지 않은 시트 스키마입니다: ' + name);
   const book = openSpreadsheet_();
   const names = [schema.name].concat(schema.aliases);
@@ -3820,7 +4013,7 @@ function schemaSheet_(
       },
     };
   };
-  return {
+  const adapter = {
     getName: () => rawSheet.getName(),
     getLastRow: () => rawSheet.getLastRow(),
     getSchemaHeaders: () => actualSchemaHeaders.slice(),
@@ -3849,6 +4042,8 @@ function schemaSheet_(
     },
     deleteRow: row => rawSheet.deleteRow(row),
   };
+  if (requestCache) requestCache.set(requestCacheKey, adapter);
+  return adapter;
 }
 function getOrCreateSheet_(name, headers) {
   // 지정 시트를 스프레드시트에서 조회하고 없으면 헤더 행을 가진 새 시트를 만듭니다.
