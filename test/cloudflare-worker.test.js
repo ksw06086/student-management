@@ -68,14 +68,21 @@ test('Cloudflare Worker request policy and proxy behavior', async t => {
     };
     try {
       const response = await worker.fetch(
-        request('POST', { 'Content-Type': 'application/json' }, '{"action":"students"}'),
+        request(
+          'POST',
+          { 'Content-Type': 'application/json', 'X-Request-ID': 'react-trace-1' },
+          '{"action":"students"}',
+        ),
         env,
       );
       assert.equal(response.status, 200);
       assert.equal(response.headers.get('Cache-Control'), 'no-store');
       assert.equal(response.headers.get('Access-Control-Allow-Origin'), origin);
       assert.equal(forwarded.url, env.APPS_SCRIPT_URL);
-      assert.equal(forwarded.init.body, '{"action":"students"}');
+      assert.deepEqual(JSON.parse(forwarded.init.body), {
+        action: 'students',
+        requestId: 'react-trace-1',
+      });
       assert.deepEqual(await response.json(), { ok: true });
     } finally {
       globalThis.fetch = originalFetch;
@@ -102,6 +109,87 @@ test('Cloudflare Worker request policy and proxy behavior', async t => {
       globalThis.fetch = originalFetch;
     }
   });
+});
+
+test('Cloudflare Worker performance logs correlate requests without logging credentials', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalLog = console.log;
+  const logs = [];
+  globalThis.fetch = async (_url, init) => {
+    assert.equal(JSON.parse(init.body).requestId, 'trace-safe-2');
+    return new Response('{"ok":true}', { status: 200 });
+  };
+  console.log = message => logs.push(String(message));
+  try {
+    const response = await worker.fetch(
+      request(
+        'POST',
+        { 'Content-Type': 'application/json', 'X-Request-ID': 'trace-safe-2' },
+        '{"action":"currentStudents","token":"do-not-log"}',
+      ),
+      { ...env, PERFORMANCE_LOGS: 'true' },
+    );
+    assert.equal(response.status, 200);
+    const entries = logs.map(line => JSON.parse(line));
+    assert.ok(entries.some(entry => entry.operation === 'apps_script.request'));
+    assert.ok(entries.some(entry => entry.operation === 'worker.request'));
+    assert.ok(entries.every(entry => entry.requestId === 'trace-safe-2'));
+    assert.ok(logs.every(line => !line.includes('do-not-log')));
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.log = originalLog;
+  }
+});
+
+test('photo-board list reuses authorized preview metadata from the first Apps Script response', async () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  let forwardedPayload;
+  const values = new Map();
+  const kv = {
+    get: async key => values.get(key) || null,
+    put: async (key, value) => values.set(key, value),
+    delete: async key => values.delete(key),
+  };
+  globalThis.fetch = async (_url, init) => {
+    calls++;
+    forwardedPayload = JSON.parse(init.body);
+    return new Response(JSON.stringify({
+      ok: true,
+      boardId: 'photo',
+      posts: [{ postId: 'photo-post', coverFileId: 'photo-file' }],
+      total: 1,
+      previewAccess: {
+        driveToken: 'private-drive-token',
+        files: [{
+          fileId: 'photo-file',
+          driveFileId: 'drive-file',
+          filename: '행사.jpg',
+          mimeType: 'image/jpeg',
+        }],
+      },
+    }));
+  };
+  try {
+    const response = await worker.fetch(
+      request(
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({ action: 'boardPosts', token: 'user-token', boardId: 'photo' }),
+      ),
+      { ...env, ARCHIVE_BRIDGE_SECRET: 'bridge', ARCHIVE_UPLOADS: kv },
+    );
+    const result = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(calls, 1, 'the separate boardPreviewInfo action is not needed');
+    assert.equal(forwardedPayload.includePreviewAccess, true);
+    assert.match(result.posts[0].previewUrl, /\/boards\/preview\//);
+    assert.equal('previewAccess' in result, false);
+    const ticketValue = [...values.values()][0];
+    assert.equal(JSON.parse(ticketValue).driveToken, 'private-drive-token');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test('Cloudflare Worker archive upload sessions and bounded chunk proxy', async t => {

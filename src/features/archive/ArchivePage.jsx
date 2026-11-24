@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Archive, Download, File, FilePlus2, Pencil, Plus, Search, Trash2, X } from 'lucide-react';
 import { formatKoreanDateTime } from '../../shared/dateFormat.js';
+import { logUiTiming } from '../../services/api.js';
 
 const PAGE_SIZE = 10;
 const CHUNK_SIZE = 8 * 1024 * 1024;
@@ -47,14 +48,19 @@ export default function ArchivePage({ auth, api, isAdmin, setMessage }) {
   const xhrRef = useRef(null);
 
   const reload = async () => {
+    // 게시글과 첨부파일 메타데이터 목록을 한 번 요청합니다. 검색·유형 필터·페이지 분할은 받은 목록에서 처리합니다.
     setLoading(true);
+    const startedAt = performance.now();
+    let outcome = 'ok';
     try {
       const result = await api('archivePosts', { token: auth.token });
       setPosts(result.posts || []);
     } catch (error) {
+      outcome = 'error';
       setMessage(error.message);
     } finally {
       setLoading(false);
+      logUiTiming('archive', 'list_load_flow', startedAt, outcome);
     }
   };
   useEffect(() => {
@@ -159,6 +165,7 @@ export default function ArchivePage({ auth, api, isAdmin, setMessage }) {
   };
 
   const uploadOne = async (session, file) => {
+    // 파일 본문을 Base64로 바꾸지 않고 8MiB Blob 조각으로 나누어 Worker에 순차 전송합니다.
     let offset = 0;
     while (offset < file.size) {
       const end = Math.min(offset + CHUNK_SIZE, file.size);
@@ -191,6 +198,7 @@ export default function ArchivePage({ auth, api, isAdmin, setMessage }) {
   };
 
   const save = async event => {
+    // 게시글 초안/수정, 업로드 세션 생성, 파일 청크 전송, 메타데이터 확정과 목록 재조회가 순서대로 수행됩니다.
     event.preventDefault();
     if (saving) return;
     const title = String(draft?.title || '').trim();
@@ -631,12 +639,14 @@ export default function ArchivePage({ auth, api, isAdmin, setMessage }) {
 function sendChunk({ uploadId, token, start, chunk, onProgress }, xhrRef) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
+    const requestId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
     xhrRef.current = xhr;
     xhr.open('POST', `${API_URL}/archive/chunk`);
     xhr.setRequestHeader('Content-Type', 'application/octet-stream');
     xhr.setRequestHeader('X-Upload-Id', uploadId);
     xhr.setRequestHeader('X-Session-Token', token);
     xhr.setRequestHeader('X-Chunk-Start', String(start));
+    xhr.setRequestHeader('X-Request-ID', requestId);
     xhr.upload.onprogress = event => {
       if (event.lengthComputable) onProgress(event.loaded);
     };

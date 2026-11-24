@@ -6,6 +6,7 @@ import {
   formatKoreanDateTime,
   toDateInputValue,
 } from '../../shared/dateFormat.js';
+import { logUiTiming } from '../../services/api.js';
 
 const EMPTY = {
   student_id: '',
@@ -53,17 +54,24 @@ export default function CurrentStudentsPage({
     [students, query],
   );
   const refresh = async () => {
+    // 재학생 목록 API는 전체 명단을 반환하고, 검색어 필터링은 이 컴포넌트의 메모리 데이터에서 수행합니다.
     setLoad('loading');
+    const startedAt = performance.now();
+    let outcome = 'ok';
     try {
       const result = await api('currentStudents', { token: auth.token });
       setStudents(result.students || []);
       setLoad('loaded');
     } catch (error) {
+      outcome = 'error';
       setLoad('error');
       setMessage(error.message);
+    } finally {
+      logUiTiming('current_students', 'list_load_flow', startedAt, outcome);
     }
   };
   const loadRecords = async id => {
+    // 선택한 학번의 상담 목록을 별도 요청하며, 연속 선택 시 오래된 응답은 sequence 검사로 무시합니다.
     const sequence = ++recordsSequence.current;
     if (!id) {
       setRecords([]);
@@ -72,6 +80,8 @@ export default function CurrentStudentsPage({
     }
     setRecords([]);
     setRecordsLoad('loading');
+    const startedAt = performance.now();
+    let outcome = 'ok';
     try {
       const result = await api('currentCounselings', { token: auth.token, studentId: id });
       if (sequence !== recordsSequence.current) return;
@@ -79,10 +89,13 @@ export default function CurrentStudentsPage({
       setPage(1);
       setRecordsLoad('loaded');
     } catch (error) {
+      outcome = 'error';
       if (sequence !== recordsSequence.current) return;
       setRecords([]);
       setRecordsLoad('error');
       setMessage(error.message);
+    } finally {
+      logUiTiming('current_students', 'counseling_load_flow', startedAt, outcome);
     }
   };
   useEffect(() => {

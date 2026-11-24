@@ -36,7 +36,7 @@ import {
   formatTransferDetailForDisplay,
   toDateInputValue,
 } from './shared/dateFormat.js';
-import { api } from './services/api.js';
+import { api, clearInFlightApiRequests, logUiTiming } from './services/api.js';
 import ToastViewport from './components/ToastViewport.jsx';
 import LoginScreen from './features/auth/LoginScreen.jsx';
 import ArchivePage from './features/archive/ArchivePage.jsx';
@@ -197,6 +197,7 @@ function App() {
     client.requestAccessToken({ prompt: 'select_account' });
   };
   // 연도 시트가 바뀌면 학생 목록을 다시 읽고 이전 학생 선택·상담 편집 상태를 초기화합니다.
+  // students API는 선택된 연도 시트 한 장을 요청하지만 Apps Script 내부에서는 해당 시트의 데이터 범위를 읽습니다.
   const loadStudents = useCallback(
     async (token = auth?.token, target = year) => {
       const sequence = ++studentsFetchSequence.current;
@@ -213,6 +214,8 @@ function App() {
       setCounselingDraft(null);
       setCounselingsLoad({ status: 'idle', error: '' });
       counselingFetchSequence.current += 1;
+      const startedAt = performance.now();
+      let outcome = 'ok';
       try {
         const result = await api('students', { token, year: target });
         if (sequence !== studentsFetchSequence.current) return;
@@ -226,9 +229,12 @@ function App() {
         setStudentsLoad({ status: 'loaded', error: '' });
         setCounselingsLoad({ status: 'idle', error: '' });
       } catch (error) {
+        outcome = 'error';
         if (sequence !== studentsFetchSequence.current) return;
         setStudentsLoad({ status: 'error', error: error.message });
         throw error;
+      } finally {
+        logUiTiming('graduates', 'list_load_flow', startedAt, outcome);
       }
     },
     [auth?.token, year],
@@ -251,6 +257,8 @@ function App() {
     if (!auth || refreshingSheets) return;
     setRefreshingSheets(true);
     setSheetsLoad({ status: 'loading', error: '' });
+    const startedAt = performance.now();
+    let outcome = 'ok';
     try {
       const result = await api('sheets', { token: auth.token });
       const latestSheets = result.sheets || [];
@@ -263,10 +271,12 @@ function App() {
       }
       if (announce) setMessage('연도 시트 목록을 최신 상태로 갱신했습니다.');
     } catch (error) {
+      outcome = 'error';
       setSheetsLoad({ status: 'error', error: error.message });
       setMessage(error.message);
     } finally {
       setRefreshingSheets(false);
+      logUiTiming('graduates', 'sheet_list_load_flow', startedAt, outcome);
     }
   };
   // 인증 정보를 탭 단위 저장소에 동기화해 새로고침 후에도 로그인 상태를 복원합니다.
@@ -320,11 +330,14 @@ function App() {
   }, [page, selected?.studentId, year]);
 
   const loadPageData = async target => {
+    // 관리자 통계 또는 사용자 목록을 각각 별도 API로 가져옵니다. 통계는 Apps Script에서 연도별 시트를 순회합니다.
     const currentState = target === 'analytics' ? analyticsLoad : usersLoad;
     if (!auth || currentState.status === 'loading') return;
     const sequence = ++pageFetchSequences.current[target];
     const setState = target === 'analytics' ? setAnalyticsLoad : setUsersLoad;
     setState({ status: 'loading', error: '' });
+    const startedAt = performance.now();
+    let outcome = 'ok';
     try {
       const result =
         target === 'analytics'
@@ -335,20 +348,26 @@ function App() {
       else setUsers(result.users || []);
       setState({ status: 'loaded', error: '' });
     } catch (error) {
+      outcome = 'error';
       if (sequence === pageFetchSequences.current[target])
         setState({ status: 'error', error: error.message });
       setMessage(error.message);
       if (error.message.includes('로그인이 만료') || error.message.includes('계정이 비활성화'))
         setAuth(null);
+    } finally {
+      logUiTiming(target, 'page_data_load_flow', startedAt, outcome);
     }
   };
   const loadCounselings = async (studentId = counselingStudentId, targetYear = year) => {
+    // 학생 선택에 연결된 상담 목록 요청이며, sequence 값으로 더 늦게 끝난 과거 응답의 상태 덮어쓰기를 막습니다.
     if (!studentId || !targetYear) {
       setCounselings([]);
       setCounselingsLoad({ status: 'loaded', error: '' });
       return;
     }
     const sequence = ++counselingFetchSequence.current;
+    const startedAt = performance.now();
+    let outcome = 'ok';
     setCounselingsLoad({ status: 'loading', error: '' });
     try {
       const result = await api('counselings', { token: auth.token, year: targetYear, studentId });
@@ -357,9 +376,12 @@ function App() {
         setCounselingsLoad({ status: 'loaded', error: '' });
       }
     } catch (error) {
+      outcome = 'error';
       if (sequence !== counselingFetchSequence.current) return;
       setCounselingsLoad({ status: 'error', error: error.message });
       throw error;
+    } finally {
+      logUiTiming('counseling', 'list_load_flow', startedAt, outcome);
     }
   };
   const selectCounselingStudent = async studentId => {
@@ -559,6 +581,7 @@ function App() {
       await api('logout', { token: auth.token });
     } catch (_) {}
     setAuth(null);
+    clearInFlightApiRequests();
     setStudents([]);
     setMessage('로그아웃되었습니다.');
   };

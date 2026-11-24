@@ -11,3 +11,12 @@ member_management_project.pdf
 .DS_Store
 !docs/
 !docs/**
+
+# 실행 소스와 Apps Script 매니페스트만 버전 관리하고 로컬 상태·배포 설정은 계속 제외합니다.
+!apps-script/
+apps-script/*
+!apps-script/Code.gs
+!apps-script/appsscript.json
+!cloudflare-worker/src/
+cloudflare-worker/src/*
+!cloudflare-worker/src/index.js

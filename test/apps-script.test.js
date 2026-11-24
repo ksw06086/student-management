@@ -13,6 +13,8 @@ function makeHarness() {
   const sheets = new Map();
   const cacheValues = new Map();
   const driveUploadMetadata = [];
+  const performanceLogs = [];
+  let spreadsheetOpenCalls = 0;
   const scriptProperties = {
     SPREADSHEET_ID: 'test-sheet',
     GOOGLE_CLIENT_ID: 'test-client',
@@ -164,7 +166,13 @@ function makeHarness() {
         },
       }),
     },
-    SpreadsheetApp: { openById: () => workbook, getScriptTimeZone: () => 'UTC' },
+    SpreadsheetApp: {
+      openById: () => {
+        spreadsheetOpenCalls++;
+        return workbook;
+      },
+      getScriptTimeZone: () => 'UTC',
+    },
     CacheService: { getScriptCache: () => cache },
     LockService: {
       getScriptLock: () => ({ tryLock: () => true, waitLock() {}, releaseLock() {} }),
@@ -201,7 +209,7 @@ function makeHarness() {
       }),
       MimeType: { JSON: 'application/json' },
     },
-    Logger: { log() {} },
+    Logger: { log: message => performanceLogs.push(String(message)) },
   });
   const source = fs.readFileSync(path.join(root, 'apps-script', 'Code.gs'), 'utf8');
   vm.runInContext(source, context, { filename: 'Code.gs' });
@@ -213,6 +221,14 @@ function makeHarness() {
     userRows: users.rows,
     sheets,
     driveUploadMetadata,
+    performanceLogs,
+    getSpreadsheetOpenCalls: () => spreadsheetOpenCalls,
+    resetSpreadsheetOpenCalls: () => {
+      spreadsheetOpenCalls = 0;
+    },
+    enablePerformanceLogs: () => {
+      scriptProperties.ENABLE_PERFORMANCE_LOGS = 'true';
+    },
     clearCache: () => cacheValues.clear(),
     setGoogleProfile: profile => {
       googleProfile = profile;
@@ -223,10 +239,35 @@ function makeHarness() {
   };
 }
 
+test('Apps Script performance timing is opt-in and correlates safe operation names by request ID', () => {
+  const app = makeHarness();
+  const login = app.call({ action: 'googleLogin', accessToken: 'mock-token' });
+
+  app.resetSpreadsheetOpenCalls();
+  assert.equal(app.call({ action: 'currentStudents', token: login.token }).ok, true);
+  assert.equal(app.getSpreadsheetOpenCalls(), 1, 'one request reuses the open spreadsheet object');
+  assert.equal(app.performanceLogs.length, 0, 'timing output is off by default');
+
+  app.enablePerformanceLogs();
+  assert.equal(
+    app.call({ action: 'currentStudents', token: login.token, requestId: 'trace-safe-1' }).ok,
+    true,
+  );
+  const entries = app.performanceLogs.map(line => JSON.parse(line));
+  assert.ok(entries.some(entry => entry.operation === 'apps_script.request'));
+  assert.ok(entries.some(entry => entry.operation === 'auth.session_check'));
+  assert.ok(entries.some(entry => entry.operation === 'api.handler'));
+  assert.ok(entries.some(entry => entry.operation === 'sheets.read_data_range'));
+  assert.ok(entries.every(entry => entry.requestId === 'trace-safe-1'));
+  assert.ok(entries.every(entry => !('token' in entry) && !('userId' in entry)));
+});
+
 class Sheet {
   constructor(name) {
     this.name = name;
     this.rows = [];
+    this.setValuesCalls = 0;
+    this.setValueCalls = 0;
   }
   getName() {
     return this.name;
@@ -279,13 +320,16 @@ class Sheet {
             String(this.rows[row - 1 + ri]?.[column - 1 + ci] ?? ''),
           ),
         ),
-      setValues: values =>
+      setValues: values => {
+        this.setValuesCalls++;
         values.forEach((line, ri) => {
           const targetRow = row - 1 + ri;
           while (this.rows.length <= targetRow) this.rows.push([]);
           for (let ci = 0; ci < line.length; ci++) this.rows[targetRow][column - 1 + ci] = line[ci];
-        }),
+        });
+      },
       setValue: value => {
+        this.setValueCalls++;
         const targetRow = row - 1;
         while (this.rows.length <= targetRow) this.rows.push([]);
         this.rows[targetRow][column - 1] = value;
@@ -1195,8 +1239,8 @@ test('regular users read and add current-student counseling in a Korean-header s
     '\uD559\uBC88',
     '\uD559\uC0DD\uC774\uB984',
     '\uC0C1\uB2F4\uC77C\uC2DC',
-    '\uC0C1\uB2F4\uB0B4\uC6A9',
     '\uC791\uC131\uC790ID',
+    '\uC0C1\uB2F4\uB0B4\uC6A9',
     '\uC791\uC131\uC790\uBA85',
     '\uC0DD\uC131\uC77C\uC2DC',
     '\uC218\uC815\uC77C\uC2DC',
@@ -1210,8 +1254,8 @@ test('regular users read and add current-student counseling in a Korean-header s
       'C001',
       'Current Student',
       new Date('2026-01-01T09:20:30+09:00'),
-      '기존 상담 내용',
       'admin',
+      '기존 상담 내용',
       'Admin User',
       '2026.01.01(목) 09:00:00',
       '2026.01.01(목) 09:00:00',
@@ -1240,10 +1284,27 @@ test('regular users read and add current-student counseling in a Korean-header s
   assert.equal(saved.ok, true, saved.error);
   assert.equal(saved.counseling.content, '새 상담 내용');
   assert.equal(saved.counseling.counseledAt, '2026.02.02(월)');
-  assert.equal(sheet.rows[0][5], '\uC0C1\uB2F4\uB0B4\uC6A9');
-  assert.equal(sheet.rows.at(-1)[5], '새 상담 내용');
-  assert.match(sheet.rows.at(-1)[8], /^\d{4}\.\d{2}\.\d{2}\(.+\) \d{2}:\d{2}:\d{2}$/);
-  assert.match(sheet.rows.at(-1)[9], /^\d{4}\.\d{2}\.\d{2}\(.+\) \d{2}:\d{2}:\d{2}$/);
+  const contentColumn = headers.indexOf('\uC0C1\uB2F4\uB0B4\uC6A9');
+  const createdColumn = headers.indexOf('\uC0DD\uC131\uC77C\uC2DC');
+  const updatedColumn = headers.indexOf('\uC218\uC815\uC77C\uC2DC');
+  assert.equal(sheet.rows.at(-1)[contentColumn], '새 상담 내용');
+  assert.match(sheet.rows.at(-1)[createdColumn], /^\d{4}\.\d{2}\.\d{2}\(.+\) \d{2}:\d{2}:\d{2}$/);
+  assert.match(sheet.rows.at(-1)[updatedColumn], /^\d{4}\.\d{2}\.\d{2}\(.+\) \d{2}:\d{2}:\d{2}$/);
+
+  const updated = app.call({
+    action: 'saveCurrentCounseling',
+    token: user.token,
+    studentId: 'C001',
+    counseling: {
+      counselingId: saved.counseling.counselingId,
+      counseledAt: '2026-02-03',
+      content: '수정한 상담 내용',
+    },
+  });
+  assert.equal(updated.ok, true, updated.error);
+  assert.equal(sheet.rows.at(-1)[contentColumn], '수정한 상담 내용');
+  assert.equal(sheet.setValuesCalls, 4, 'reordered columns are written in contiguous ranges');
+  assert.equal(sheet.setValueCalls, 0, 'the adapter does not write the counseling row cell by cell');
 });
 
 test('graduate transfer creates only the server current-year tab from the latest template without copying its student rows', () => {
@@ -1623,6 +1684,37 @@ test('new boards initialize explicitly and enforce board isolation and ownership
     app.call({ action: 'restoreBoardPost', token: admin.token, postId: first.postId }).ok,
     true,
   );
+});
+
+test('photo board can return authorized preview metadata with its page to avoid a second sheet API request', () => {
+  const app = makeHarness();
+  const admin = app.call({ action: 'googleLogin', accessToken: 'mock-token' });
+  assert.equal(app.call({ action: 'initializeBoards', token: admin.token }).ok, true);
+  app.sheets.get('게시판게시글').rows.push([
+    'photo-post', 'photo', '행사 사진', '', 'admin', 'Admin User', '2026.11.20(금) 10:00:00',
+    '2026.11.20(금) 10:00:00', 0, 'active', false, false, false, false, 'photo-file', '',
+  ]);
+  app.sheets.get('게시판파일').rows.push([
+    'photo-file', 'photo', 'photo-post', 'drive-file', '행사.jpg', '행사.jpg', 'image',
+    'image/jpeg', 123, 'folder', 'admin', '2026.11.20(금) 10:00:00', 'active', 0,
+  ]);
+
+  const result = app.call({
+    action: 'boardPosts',
+    token: admin.token,
+    boardId: 'photo',
+    includePreviewAccess: true,
+  });
+  assert.equal(result.ok, true, result.error);
+  assert.equal(result.previewAccess.driveToken, 'test-drive-token');
+  assert.deepEqual(JSON.parse(JSON.stringify(result.previewAccess.files)), [
+    {
+      fileId: 'photo-file',
+      driveFileId: 'drive-file',
+      filename: '행사.jpg',
+      mimeType: 'image/jpeg',
+    },
+  ]);
 });
 
 test('board initialization refuses to overwrite incompatible existing headers', () => {
