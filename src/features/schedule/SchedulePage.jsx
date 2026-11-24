@@ -57,11 +57,13 @@ async function loadHolidayMonth(year, month) {
 async function send(action, token, payload = {}) {
   // 일정 화면의 API 어댑터입니다. 인증 토큰과 action을 붙여 Worker에 보내고 응답 오류를 예외로 바꿉니다.
   if (!API_URL) throw new Error('VITE_API_BASE_URL이 설정되지 않았습니다.');
+  const requestId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
+  const startedAt = performance.now();
   let response;
   try {
     response = await fetch(API_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Request-ID': requestId },
       body: JSON.stringify({ action, token, ...payload }),
     });
   } catch (_) {
@@ -75,6 +77,13 @@ async function send(action, token, payload = {}) {
   }
   if (!response.ok || !result.ok)
     throw new Error(result.error || `요청에 실패했습니다. (HTTP ${response.status})`);
+  if (import.meta.env.DEV)
+    console.debug('[API timing]', {
+      action,
+      requestId,
+      durationMs: Math.round((performance.now() - startedAt) * 100) / 100,
+      outcome: 'ok',
+    });
   return result;
 }
 

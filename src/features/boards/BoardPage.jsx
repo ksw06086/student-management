@@ -30,6 +30,7 @@ import {
   X,
 } from 'lucide-react';
 import { formatKoreanDateTime } from '../../shared/dateFormat.js';
+import { logUiTiming } from '../../services/api.js';
 import {
   BOARD_DEFINITIONS,
   BOARD_DRAFT_KEY,
@@ -115,6 +116,7 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
   const visiblePageCount = hasCurrentList ? Math.max(1, Math.ceil(total / BOARD_PAGE_SIZE)) : 1;
 
   const loadStatus = useCallback(async () => {
+    // 게시판 초기화 상태를 먼저 확인하며, 성공한 뒤 목록과 알림 조회가 이어집니다.
     try {
       const result = await api('boardStatus', { token: auth.token });
       setInitialized(result.initialized ? result : result);
@@ -124,6 +126,7 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
   }, [api, auth.token]);
 
   const loadList = useCallback(async () => {
+    // 현재 게시판·보기·검색 조건·정렬·페이지를 API에 전달합니다. 새 요청 번호와 키로 이전 응답을 구분합니다.
     if (!initialized?.initialized || !['list', 'drafts', 'trash'].includes(view)) return;
     const requestId = ++listRequestRef.current;
     const requestKey = `${boardId}:${view}`;
@@ -134,6 +137,8 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
     setLoading(true);
     setListError(null);
     setListErrorKey('');
+    const startedAt = performance.now();
+    let outcome = 'ok';
     try {
       const result = await api('boardPosts', {
         token: auth.token,
@@ -151,11 +156,13 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
       setLoadedListKey(requestKey);
       setSelectedIds([]);
     } catch (error) {
+      outcome = 'error';
       if (requestId !== listRequestRef.current) return;
       setListError(error);
       setListErrorKey(requestKey);
     } finally {
       if (requestId === listRequestRef.current) setLoading(false);
+      logUiTiming('boards', 'list_load_flow', startedAt, outcome);
     }
   }, [api, appliedFilters, auth.token, boardId, initialized, page, view]);
 
@@ -185,12 +192,14 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
   }, [initialized, loadNotifications]);
   useEffect(() => {
     if (!isPhoto || !posts.length) return;
-    const imageIds = posts.map(post => post.coverFileId).filter(Boolean);
-    if (!imageIds.length) return;
-    api('boardImagePreviews', { token: auth.token, fileIds: imageIds })
-      .then(result => setPreviews(current => ({ ...current, ...result.previews })))
-      .catch(() => {});
-  }, [api, auth.token, isPhoto, posts]);
+    const listPreviews = Object.fromEntries(
+      posts
+        .filter(post => post.coverFileId && post.previewUrl)
+        .map(post => [post.coverFileId, post.previewUrl]),
+    );
+    if (Object.keys(listPreviews).length)
+      setPreviews(current => ({ ...current, ...listPreviews }));
+  }, [isPhoto, posts]);
   useEffect(() => {
     if (!detail) return;
     const imageIds = (detail.files || []).filter(isBoardImageFile).map(file => file.fileId);
@@ -475,6 +484,7 @@ export default function BoardPage({ auth, api, isAdmin, notify }) {
   }
 
   async function uploadOne(upload, file) {
+    // 각 파일을 8MiB 이하 Blob 청크로 나누어 순차 전송하고 Worker가 돌려준 실제 수신 위치로 이어갑니다.
     let offset = 0;
     setActiveUploadId(upload.uploadId);
     setFailedUploadIds(current => current.filter(id => id !== upload.uploadId));
@@ -2604,12 +2614,14 @@ function sendBoardChunk({ uploadId, token, start, chunk, onProgress }, xhrRef) {
   return new Promise((resolve, reject) => {
     if (!API_URL) return reject(new Error('API 주소가 설정되지 않았습니다.'));
     const xhr = new XMLHttpRequest();
+    const requestId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
     xhrRef.current = { xhr, uploadId };
     xhr.open('POST', `${API_URL}/boards/chunk`);
     xhr.setRequestHeader('Content-Type', 'application/octet-stream');
     xhr.setRequestHeader('X-Upload-Id', uploadId);
     xhr.setRequestHeader('X-Session-Token', token);
     xhr.setRequestHeader('X-Chunk-Start', String(start));
+    xhr.setRequestHeader('X-Request-ID', requestId);
     xhr.upload.onprogress = event => {
       if (event.lengthComputable) onProgress(event.loaded);
     };
