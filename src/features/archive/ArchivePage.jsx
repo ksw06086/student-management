@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Archive, Download, File, FilePlus2, Pencil, Plus, Search, Trash2, X } from 'lucide-react';
 import { formatKoreanDateTime } from '../../shared/dateFormat.js';
 import { logUiTiming } from '../../services/api.js';
@@ -34,6 +34,7 @@ const TYPE_LABELS = { image: '이미지', video: '동영상', document: '문서'
 
 export default function ArchivePage({ auth, api, isAdmin, setMessage }) {
   const [posts, setPosts] = useState([]),
+    [total, setTotal] = useState(0),
     [loading, setLoading] = useState(true);
   const [query, setQuery] = useState(''),
     [sort, setSort] = useState('newest'),
@@ -46,26 +47,33 @@ export default function ArchivePage({ auth, api, isAdmin, setMessage }) {
   const [saving, setSaving] = useState(false),
     [progress, setProgress] = useState({});
   const xhrRef = useRef(null);
+  const listRequestRef = useRef(0);
 
-  const reload = async () => {
+  const reload = async (taskId = '') => {
     // 게시글과 첨부파일 메타데이터 목록을 한 번 요청합니다. 검색·유형 필터·페이지 분할은 받은 목록에서 처리합니다.
     setLoading(true);
+    const requestId = ++listRequestRef.current;
     const startedAt = performance.now();
     let outcome = 'ok';
     try {
-      const result = await api('archivePosts', { token: auth.token });
+      const result = await api('archivePosts', {
+        token: auth.token, taskId, query, sort, typeFilter, page, pageSize: PAGE_SIZE,
+      });
+      if (requestId !== listRequestRef.current) return;
       setPosts(result.posts || []);
+      setTotal(Number(result.total) || 0);
     } catch (error) {
       outcome = 'error';
-      setMessage(error.message);
+      if (requestId === listRequestRef.current) setMessage(error.message);
     } finally {
-      setLoading(false);
+      if (requestId === listRequestRef.current) setLoading(false);
       logUiTiming('archive', 'list_load_flow', startedAt, outcome);
     }
   };
   useEffect(() => {
-    reload();
-  }, [auth.token]);
+    const timer = window.setTimeout(() => reload(), query ? 250 : 0);
+    return () => window.clearTimeout(timer);
+  }, [auth.token, query, sort, typeFilter, page]);
   useEffect(() => {
     if (!saving) return undefined;
     const warn = event => {
@@ -76,35 +84,8 @@ export default function ArchivePage({ auth, api, isAdmin, setMessage }) {
     return () => window.removeEventListener('beforeunload', warn);
   }, [saving]);
 
-  const filtered = useMemo(() => {
-    const needle = query.trim().toLocaleLowerCase('ko-KR');
-    const result = posts.filter(post => {
-      const textMatch =
-        !needle ||
-        [
-          post.title,
-          post.content,
-          post.authorName,
-          ...(post.files || []).map(file => file.originalFilename),
-        ].some(value =>
-          String(value || '')
-            .toLocaleLowerCase('ko-KR')
-            .includes(needle),
-        );
-      const typeMatch =
-        typeFilter === 'all' || (post.files || []).some(file => file.fileType === typeFilter);
-      return textMatch && typeMatch;
-    });
-    return [...result].sort((a, b) =>
-      sort === 'oldest'
-        ? String(a.createdAt).localeCompare(String(b.createdAt))
-        : sort === 'title'
-          ? String(a.title).localeCompare(String(b.title), 'ko')
-          : String(b.createdAt).localeCompare(String(a.createdAt)),
-    );
-  }, [posts, query, sort, typeFilter]);
-  const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
-  const visible = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+  const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const visible = posts;
 
   const openPost = async post => {
     setSelected(post);
@@ -164,7 +145,7 @@ export default function ArchivePage({ auth, api, isAdmin, setMessage }) {
     setPendingFiles(next);
   };
 
-  const uploadOne = async (session, file) => {
+  const uploadOne = async (session, file, taskId) => {
     // 파일 본문을 Base64로 바꾸지 않고 8MiB Blob 조각으로 나누어 Worker에 순차 전송합니다.
     let offset = 0;
     while (offset < file.size) {
@@ -174,6 +155,7 @@ export default function ArchivePage({ auth, api, isAdmin, setMessage }) {
         {
           uploadId: session.uploadId,
           token: auth.token,
+          taskId,
           start: offset,
           chunk,
           onProgress: value =>
@@ -203,12 +185,14 @@ export default function ArchivePage({ auth, api, isAdmin, setMessage }) {
     if (saving) return;
     const title = String(draft?.title || '').trim();
     if (!title) return setMessage('제목을 입력해 주세요.');
+    const taskId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
     setSaving(true);
     try {
       let postId = draft.postId;
       if (!postId) {
         const created = await api('saveArchivePost', {
           token: auth.token,
+          taskId,
           post: { title, content: String(draft.content || ''), publish: pendingFiles.length === 0 },
         });
         postId = created.postId;
@@ -216,6 +200,7 @@ export default function ArchivePage({ auth, api, isAdmin, setMessage }) {
       } else {
         await api('saveArchivePost', {
           token: auth.token,
+          taskId,
           post: { postId, title, content: String(draft.content || '') },
         });
       }
@@ -224,6 +209,7 @@ export default function ArchivePage({ auth, api, isAdmin, setMessage }) {
       if (pendingFiles.length && !sessions.length) {
         const result = await api('archiveUploadStart', {
           token: auth.token,
+          taskId,
           postId,
           files: pendingFiles.map(file => ({
             name: file.name,
@@ -239,12 +225,12 @@ export default function ArchivePage({ auth, api, isAdmin, setMessage }) {
           item => item.name === session.originalFilename && item.size === session.fileSize,
         );
         if (!file) throw new Error('업로드할 원본 파일이 없습니다. 파일을 다시 선택해 주세요.');
-        await uploadOne(session, file);
+        await uploadOne(session, file, taskId);
         setUploadSessions(current => current.filter(item => item.uploadId !== session.uploadId));
         setPendingFiles(current => current.filter(item => item !== file));
       }
       if (postId && (draft.postId || pendingFiles.length))
-        await api('publishArchivePost', { token: auth.token, postId });
+        await api('publishArchivePost', { token: auth.token, postId, taskId });
       for (const file of draft.existingFiles || []) {
         if (file._remove)
           await api('deleteArchiveFile', { token: auth.token, fileId: file.fileId });
@@ -253,7 +239,7 @@ export default function ArchivePage({ auth, api, isAdmin, setMessage }) {
       setPendingFiles([]);
       setUploadSessions([]);
       setProgress({});
-      await reload();
+      await reload(taskId);
       setMessage('자료를 등록했습니다.');
     } catch (error) {
       setMessage(error.message);
@@ -376,7 +362,7 @@ export default function ArchivePage({ auth, api, isAdmin, setMessage }) {
               <tbody>
                 {visible.map((post, index) => (
                   <tr key={post.postId}>
-                    <td>{filtered.length - ((page - 1) * PAGE_SIZE + index)}</td>
+                    <td>{total - ((page - 1) * PAGE_SIZE + index)}</td>
                     <td>
                       <button className="archive-title-link" onClick={() => openPost(post)}>
                         {post.title}
@@ -392,7 +378,7 @@ export default function ArchivePage({ auth, api, isAdmin, setMessage }) {
             </table>
             {!visible.length && (
               <div className="empty-detail">
-                {query ? '검색 결과가 없습니다.' : '등록된 자료가 없습니다.'}
+                {query || typeFilter !== 'all' ? '검색 결과가 없습니다.' : '등록된 자료가 없습니다.'}
               </div>
             )}
           </div>
@@ -636,7 +622,7 @@ export default function ArchivePage({ auth, api, isAdmin, setMessage }) {
   );
 }
 
-function sendChunk({ uploadId, token, start, chunk, onProgress }, xhrRef) {
+function sendChunk({ uploadId, token, start, chunk, onProgress, taskId }, xhrRef) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     const requestId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
@@ -647,6 +633,7 @@ function sendChunk({ uploadId, token, start, chunk, onProgress }, xhrRef) {
     xhr.setRequestHeader('X-Session-Token', token);
     xhr.setRequestHeader('X-Chunk-Start', String(start));
     xhr.setRequestHeader('X-Request-ID', requestId);
+    if (taskId) xhr.setRequestHeader('X-Task-ID', taskId);
     xhr.upload.onprogress = event => {
       if (event.lengthComputable) onProgress(event.loaded);
     };

@@ -1480,6 +1480,19 @@ test('localized archive sheet names and reordered Korean columns remain readable
   assert.equal(values[localizedHeaders.indexOf('\uB0B4\uC6A9')], '저장 확인');
 });
 
+test('archive list applies search, sort, and pagination in Apps Script and returns total count', () => {
+  const app = makeHarness();
+  const admin = app.call({ action: 'googleLogin', accessToken: 'mock-token' });
+  for (let index = 0; index < 12; index++) {
+    app.call({ action: 'saveArchivePost', token: admin.token, post: { title: `record-${index}`, content: index % 2 ? 'needle' : '' } });
+  }
+  const page = app.call({ action: 'archivePosts', token: admin.token, query: 'needle', sort: 'title', page: 2, pageSize: 3 });
+  assert.equal(page.ok, true, page.error);
+  assert.equal(page.total, 6);
+  assert.equal(page.posts.length, 3);
+  assert.ok(page.posts.every(post => post.content === 'needle'));
+});
+
 test('archive sheet name collision stops access without creating or changing either sheet', () => {
   const app = makeHarness();
   const admin = app.call({ action: 'googleLogin', accessToken: 'mock-token' });
@@ -1623,6 +1636,9 @@ test('new boards initialize explicitly and enforce board isolation and ownership
     comment: { postId: first.postId, content: 'first comment' },
   });
   assert.equal(comment.ok, true, comment.error);
+  assert.equal(comment.comment.commentId, comment.commentId);
+  assert.equal(comment.comment.content, 'first comment');
+  assert.equal(comment.commentCount, 1);
   const reply = app.call({
     action: 'saveBoardComment',
     token: admin.token,
@@ -1648,7 +1664,7 @@ test('new boards initialize explicitly and enforce board isolation and ownership
   );
   assert.equal(
     app.call({ action: 'boardNotifications', token: user.token }).notifications.length,
-    1,
+    2,
   );
   assert.equal(
     app.call({
@@ -1698,6 +1714,15 @@ test('photo board can return authorized preview metadata with its page to avoid 
     'photo-file', 'photo', 'photo-post', 'drive-file', '행사.jpg', '행사.jpg', 'image',
     'image/jpeg', 123, 'folder', 'admin', '2026.11.20(금) 10:00:00', 'active', 0,
   ]);
+  app.sheets.get('게시판파일').rows.push([
+    'thumb-file', 'photo', 'photo-post', 'thumb-drive-file', '(피드 썸네일)',
+    'thumbnail-of:photo-file', 'thumbnail', 'image/jpeg', 45, 'folder', 'admin',
+    '2026.11.20(금) 10:00:00', 'thumbnail', 0,
+  ]);
+  app.sheets.get('게시판파일').rows.push([
+    'photo-file-2', 'photo', 'photo-post', 'drive-file-2', '두번째.jpg', '두번째.jpg', 'image',
+    'image/jpeg', 124, 'folder', 'admin', '2026.11.20(금) 10:00:00', 'active', 1,
+  ]);
 
   const result = app.call({
     action: 'boardPosts',
@@ -1707,14 +1732,53 @@ test('photo board can return authorized preview metadata with its page to avoid 
   });
   assert.equal(result.ok, true, result.error);
   assert.equal(result.previewAccess.driveToken, 'test-drive-token');
+  assert.deepEqual(JSON.parse(JSON.stringify(result.posts[0].files.map(file => file.fileId))), ['photo-file', 'photo-file-2'], 'every active photo appears in order and hidden thumbnail metadata is excluded');
   assert.deepEqual(JSON.parse(JSON.stringify(result.previewAccess.files)), [
     {
       fileId: 'photo-file',
       driveFileId: 'drive-file',
+      thumbnailDriveFileId: 'thumb-drive-file',
       filename: '행사.jpg',
       mimeType: 'image/jpeg',
     },
+    {
+      fileId: 'photo-file-2',
+      driveFileId: 'drive-file-2',
+      thumbnailDriveFileId: '',
+      filename: '두번째.jpg',
+      mimeType: 'image/jpeg',
+    },
   ]);
+});
+
+test('photo feed comments are fetched without incrementing view count and include comment permissions', () => {
+  const app = makeHarness();
+  const admin = app.call({ action: 'googleLogin', accessToken: 'mock-token' });
+  assert.equal(app.call({ action: 'initializeBoards', token: admin.token }).ok, true);
+  const post = app.call({ action: 'saveBoardPost', token: admin.token, post: { boardId: 'board_1', title: 'feed', content: '', publish: true } });
+  const before = app.sheets.get('게시판게시글').rows[1][8];
+  app.call({ action: 'saveBoardComment', token: admin.token, comment: { postId: post.postId, content: 'hello' } });
+  const result = app.call({ action: 'boardComments', token: admin.token, boardId: 'board_1', postId: post.postId });
+  assert.equal(result.ok, true, result.error);
+  assert.equal(result.post.comments.length, 1);
+  assert.equal(result.post.comments[0].canManage, true);
+  assert.equal(app.sheets.get('게시판게시글').rows[1][8], before, 'expanding feed comments does not count as opening the detail page');
+});
+
+test('board list cache is session-scoped, invalidated after writes, and does not bypass authentication', () => {
+  const app = makeHarness();
+  const login = app.call({ action: 'googleLogin', accessToken: 'mock-token' });
+  assert.equal(app.call({ action: 'initializeBoards', token: login.token }).ok, true);
+  app.call({ action: 'saveBoardPost', token: login.token, post: { boardId: 'board_1', title: 'one', content: '' } });
+  const request = { action: 'boardPosts', token: login.token, boardId: 'board_1', page: 1, pageSize: 10 };
+  assert.equal(app.call(request).total, 1);
+  const postsSheet = [...app.sheets.values()].find(sheet => sheet.rows[0]?.length === 16);
+  postsSheet.rows.push(['external', 'board_1', 'external', '', 'admin', 'Admin User', '', '', 0, 'active', false, false, false, false, '', '']);
+  assert.equal(app.call(request).total, 1, 'the short-lived response cache is reused for identical reads');
+  app.call({ action: 'saveBoardPost', token: login.token, post: { boardId: 'board_1', title: 'two', content: '' } });
+  assert.equal(app.call(request).total, 3, 'a successful write invalidates the previous list generation');
+  app.userRows[1][5] = false;
+  assert.equal(app.call(request).ok, false, 'every cache hit still passes through session and active-user validation');
 });
 
 test('board initialization refuses to overwrite incompatible existing headers', () => {
@@ -1784,6 +1848,18 @@ test('board upload sessions preserve client IDs and reject duplicate IDs', () =>
     app.driveUploadMetadata.map(metadata => metadata.name),
     ['행사 사진 (가족).jpg', '행사 사진 (가족).jpg'],
   );
+
+  app.sheets.get('게시판파일').rows.push([
+    'source-file', 'photo', post.postId, 'source-drive-file', 'source.jpg', 'source.jpg', 'image',
+    'image/jpeg', 80, 'folder', login.user.userId, '2026.11.20(금) 10:00:00', 'active', 0,
+  ]);
+  const thumbnail = app.call({
+    action: 'boardUploadStart', token: login.token, bridgeSecret: 'test-bridge-secret',
+    boardId: 'photo', postId: post.postId,
+    files: [{ clientId: 'thumb-client', name: 'thumbnail-source.jpg', size: 9, mimeType: 'image/jpeg', thumbnailForFileId: 'source-file' }],
+  });
+  assert.equal(thumbnail.ok, true, thumbnail.error);
+  assert.equal(app.driveUploadMetadata.at(-1).appProperties.boardThumbnailFor, 'source-file');
 
   const duplicateIds = app.call({
     action: 'boardUploadStart',

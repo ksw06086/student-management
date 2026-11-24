@@ -10,6 +10,8 @@ const DEDUPLICATED_READ_ACTIONS = new Set([
   'schedules',
   'logs',
   'boardPosts',
+  'boardComments',
+  'boardImagePreviews',
   'boardStatus',
   'boardNotifications',
   'boardAdminStats',
@@ -32,6 +34,7 @@ export async function api(action, payload = {}) {
     : '';
   if (dedupeKey && inFlightReads.has(dedupeKey)) return inFlightReads.get(dedupeKey);
 
+
   const requestId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
   const startedAt = performance.now();
   const request = (async () => {
@@ -39,7 +42,11 @@ export async function api(action, payload = {}) {
     try {
       response = await fetch(API_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Request-ID': requestId },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Request-ID': requestId,
+          ...(payload.taskId ? { 'X-Task-ID': payload.taskId } : {}),
+        },
         body: JSON.stringify({ action, ...payload }),
       });
     } catch (_) {
